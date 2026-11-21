@@ -1514,7 +1514,8 @@ def tuning_compare_lines(res, base):
 
 
 def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s,
-                 stack_text=None, version_label=None, base=None, dom_probe=None):
+                 stack_text=None, version_label=None, base=None, dom_probe=None,
+                 dom_skip_reason=None):
     """生成干净的文字报告。"""
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = [
@@ -1558,6 +1559,10 @@ def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s,
             lines.append("  链路干净。")
         else:
             lines.append("  丢包偏高，晚高峰可能更差。")
+    elif dom_skip_reason:
+        # 国内点没测：报告里也要写明原因，不然拿到报告的人会以为漏测了。
+        lines.append("")
+        lines.append("国内路径：未测（%s）。" % dom_skip_reason)
     lines.append("")
     lines.append("结论：" + verdict_text(res))
     lines.append("")
@@ -1728,9 +1733,22 @@ def main(argv=None):
     log(f"  能力点：{peer_label}（{peer}）[{version_label}]")
     if dom is not None:
         dom_peer, dom_label, dom_version = dom
+        dom_skip_reason = None
         log(f"  国内点：{dom_label}（{dom_peer}）")
     else:
         dom_peer = None
+        # 国内点没有：必须明确告诉使用者原因，不能悄悄跳过。
+        # 手动 --peer 是故意只测一个点，不提示；否则分两种情况：
+        # 1) 清单里根本没有该运营商的内地节点（移动/联通/广电现在就是这样）；
+        # 2) 有节点但都 ping 不通。
+        dom_skip_reason = None
+        if not args.peer and isp_name:
+            matched = [p for p in peers if p[2] == isp_name]
+            if not matched:
+                dom_skip_reason = "%s在内地没有公开的 iperf3 测速节点（节点清单里只有电信的 5 个）" % isp_name
+            else:
+                dom_skip_reason = "%s的国内节点都 ping 不通" % isp_name
+            warn("  [!] 国内点未测：%s，国内路径这段跳过，只测能力点（限速器/真实带宽不受影响）。" % dom_skip_reason)
 
     # 3. 网卡
     iface = detect_iface()
@@ -1795,7 +1813,8 @@ def main(argv=None):
     log("结论：" + verdict_text(res))
     log("=" * 60)
     report = build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed,
-                          stack_text, version_label, base, dom_probe)
+                          stack_text, version_label, base, dom_probe,
+                          dom_skip_reason=dom_skip_reason)
     log()
     print(report)
     save_report(report, res, dom_probe)
