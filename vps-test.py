@@ -51,9 +51,15 @@ SPIKE_HITS_NEEDED = 2
 # MSS（字节），用于把重传数换算成丢包率
 MSS = 1448
 
-# 默认测速点（v1.0.0）：洛杉矶 / 东京 Leaseweb。国内节点待后续补充。
+# 默认测速点：沿用 tcpfit 的公共 iperf3 节点池（亚太部分）。
+# 来源：tcpfit PEER_POOL（Kylin010/tcpfit），完整列表见 https://iperf3serverlist.net。
+# 注意：tcpfit 池子里也没有中国内地节点——离中国最近的稳定节点就是香港/新加坡。
 PEERS = [
     ("speedtest.lax12.us.leaseweb.net", "洛杉矶 Leaseweb"),
+    ("speedtest.hkg12.hk.leaseweb.net", "香港 Leaseweb"),
+    ("speedtest.sin1.sg.leaseweb.net", "新加坡 Leaseweb"),
+    ("sgp.proof.ovh.net", "新加坡 OVH"),
+    ("speedtest.syd12.au.leaseweb.net", "悉尼 Leaseweb"),
     ("speedtest.tyo11.jp.leaseweb.net", "东京 Leaseweb"),
 ]
 IPERF_PORTS = [5201, 5202, 5203, 5204, 5205]
@@ -424,7 +430,7 @@ def pick_peer(cli_peer=None, stack=(True, True)):
                 if best is None or rtt < best[0]:
                     best = (rtt, host, label, ver)
     if best is None:
-        warn("测速点都 ping 不通，默认用东京 Leaseweb。")
+        warn("测速点都 ping 不通，默认用香港 Leaseweb。")
         return PEERS[1][0], PEERS[1][1] + "（默认）", versions[0]
     return best[1], f"{best[2]}（延迟 {best[0]:.1f} ms）", best[3]
 
