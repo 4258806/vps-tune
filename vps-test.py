@@ -229,7 +229,7 @@ def classify_isp(info):
 
 
 def manual_isp_menu(detected_no=None):
-    """手动选运营商。返回 1-4；选 0 直接退出（5 也行）。"""
+    """手动选运营商。返回 1-4；选 0 直接退出（5/6/7 留给以后加功能）。"""
     log()
     log("请选择你的宽带运营商：")
     for no in sorted(ISPS):
@@ -242,7 +242,7 @@ def manual_isp_menu(detected_no=None):
             print()
             warn("已取消。")
             sys.exit(1)
-        if ans in ("0", "5"):
+        if ans == "0":
             log("已退出。")
             sys.exit(0)
         if ans in ("1", "2", "3", "4"):
