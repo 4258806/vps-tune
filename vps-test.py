@@ -1441,7 +1441,7 @@ class Sweep:
             result["recommend"] = recommend
             ok(f"实测上限 {knee} Mbit，按 {knee}M 档位退 {margin} 余量"
                f" → 建议整形值 {recommend} Mbit")
-            log(f"  （v1.0.0 只做测试，不下发整形；调优功能后续版本再加）")
+            log(f"  （v{VERSION} 只做测试，不下发整形；调优功能后续版本再加）")
             return result
 
 
@@ -1460,8 +1460,8 @@ def verdict_text(res):
             # 已达标时没有东西可下发，不加“暂不下发”。
             if res.get("shaping_status") == "ok":
                 return head + shape
-            return head + shape + "（v1.0.0 暂不下发）"
-        return (head + f"建议整形 {res['recommend']} Mbit（v1.0.0 暂不下发）")
+            return head + shape + "（v%s 暂不下发）" % VERSION
+        return (head + f"建议整形 {res['recommend']} Mbit（v{VERSION} 暂不下发）")
     if status == "cancelled":
         return "扫描已取消，只做了不限速探测"
     if status == "inconclusive":
@@ -1470,7 +1470,7 @@ def verdict_text(res):
 
 
 def tuning_compare_lines(res, base):
-    """调优前后对比。v1.0.0 只测不调，所以“调优后”是按建议值整形后的预期，
+    """调优前后对比。当前版本只测不调，所以“调优后”是按建议值整形后的预期，
     不是实测——等“调”版本下发整形并复测后，这里会换成实测对比。"""
     lines = ["调优前后对比："]
     if res["status"] == "no_knee":
@@ -1527,10 +1527,10 @@ def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s,
         lines.append("实测上限：%d Mbit" % res["knee"])
         shape = res.get("shaping_text")
         if shape:
-            suffix = "" if res.get("shaping_status") == "ok" else "（仅供参考，v1.0.0 不下发）"
+            suffix = "" if res.get("shaping_status") == "ok" else "（仅供参考，v%s 不下发）" % VERSION
             lines.append("整形：%s%s" % (shape, suffix))
         else:
-            lines.append("建议整形值：%d Mbit（仅供参考，v1.0.0 不下发）" % res["recommend"])
+            lines.append("建议整形值：%d Mbit（仅供参考，v%s 不下发）" % (res["recommend"], VERSION))
     elif res["status"] == "no_knee":
         lines.append("限速器：未检测到")
     if dom_probe is not None:
