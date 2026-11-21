@@ -892,9 +892,9 @@ def shaping_status(current_mbit, knee, recommend):
     return "ok", f"当前整形 {current_mbit} Mbit 已达标，无需调整"
 
 
-def estimate_scan_traffic_gb(lo, hi, step, dur):
-    """估算一次扫描的流量（GB）：粗扫各档 + 细扫上限 8 档。"""
-    points = (hi - lo) // step + 2 + 8
+def estimate_scan_traffic_gb(lo, hi, step, dur, fine_points=8):
+    """估算一次扫描的流量（GB）：粗扫各档 + 细扫上限 fine_points 档。"""
+    points = (hi - lo) // step + 2 + fine_points
     avg_rate = (lo + hi) / 2.0
     return points * avg_rate * dur / 8 / 1024
 
@@ -904,12 +904,14 @@ def estimate_scan_traffic_gb(lo, hi, step, dur):
 class Sweep:
     """拐点扫描：不限速探测 -> 估算流量 -> 粗扫 -> 细扫 -> 给出拐点。"""
 
-    def __init__(self, peer, iface, dur=DEFAULT_DUR, assume_yes=False, version="4"):
+    def __init__(self, peer, iface, dur=DEFAULT_DUR, assume_yes=False, version="4",
+                 quick=False):
         self.peer = peer
         self.iface = iface
         self.dur = dur
         self.assume_yes = assume_yes
         self.version = version
+        self.quick = quick  # 快速模式：少测几档、不细扫，流量省约 2/3，拐点较粗
         self.base_loss = None      # 干净链路的本底丢包率（%）
         self.last_ok = None        # 最后一个干净档位（Mbit）
         self.broke_at = None       # 第一个确认丢包的档位（Mbit）
@@ -1075,7 +1077,7 @@ class Sweep:
             # -- 不限速探测：丢包低 = 没东西在打你 = 不用扫；丢包高 = 有限速器。
             log()
             info(f"Peer {self.peer}")
-            info(f"不限速探测（12 秒，单流）")
+            info(f"不限速探测（{self.dur} 秒，单流）")
             log("  %-10s %12s %9s %8s  %s" % ("速率/Mbit", "送达/Mbps", "重传", "丢包%", "结论"))
             if not guard.set_fq():
                 warn("切到 fq 失败，探测取消。")
@@ -1095,6 +1097,7 @@ class Sweep:
                 "knee": None,
                 "recommend": None,
                 "rows": self.rows,
+                "quick": self.quick,
             }
             if unshaped_loss <= LOSS_THRESHOLD:
                 log()
@@ -1111,10 +1114,13 @@ class Sweep:
             hi = min(10000, int(recv * k))
             if hi <= lo:
                 hi = lo + 2
-            step = max(1, round((hi - lo) / 10))
+            # 快速模式：粗步长（5 档）、不细扫，拐点精度约一个步长。
+            npoints = 5 if self.quick else 10
+            step = max(1, round((hi - lo) / npoints))
 
             # -- 扫之前先报流量账（教训：大带宽机器一次能扫掉上百 GB）。
-            est_gb = estimate_scan_traffic_gb(lo, hi, step, self.dur)
+            est_gb = estimate_scan_traffic_gb(lo, hi, step, self.dur,
+                                              fine_points=0 if self.quick else 8)
             log()
             warn(f"有限速器，准备扫描 {lo} -> {hi} Mbit。")
             log(f"    按这个区间估算，本次扫描可能消耗约 {est_gb:.1f} GB 流量。")
@@ -1188,7 +1194,9 @@ class Sweep:
                 return result
 
             # 粗扫只定位到拐点在 LAST_OK 与 BROKE_AT 之间，用 1/4 步长细扫。
-            if (self.last_ok is not None and self.broke_at is not None
+            # 快速模式不细扫，拐点就是粗扫的 last_ok（精度约一个粗步长）。
+            if (not self.quick and self.last_ok is not None
+                    and self.broke_at is not None
                     and self.broke_at - self.last_ok > 1):
                 coarse_broke = self.broke_at
                 width = coarse_broke - self.last_ok
@@ -1271,6 +1279,8 @@ def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s,
     if version_label:
         lines.append("测试走：%s" % version_label)
     lines.append("测速点：%s" % peer_label)
+    if res.get("quick"):
+        lines.append("模式：快速粗测（每档 5 秒、不细扫，拐点精度较粗）")
     if base:
         lines.append("")
         lines.append("当前系统参数（未调优）：")
@@ -1400,6 +1410,9 @@ def parse_args(argv):
                         help="跑完不删除脚本和历史记录（默认自动清除，只留报告）")
     parser.add_argument("--dur", type=int, default=DEFAULT_DUR,
                         help="每个速率点测试时长（秒，默认 12，范围 5-60）")
+    parser.add_argument("--quick", action="store_true",
+                        help="快速模式：每档 5 秒、只粗扫不细扫，流量省约 2/3，"
+                             "拐点精度较粗（约一个粗步长）")
     args = parser.parse_args(argv)
     if args.dur < 5 or args.dur > 60:
         parser.error("--dur 必须是 5-60 的整数")
@@ -1456,7 +1469,11 @@ def main(argv=None):
         log(line)
 
     # 4. 拐点扫描
-    sweep = Sweep(peer, iface, dur=args.dur, assume_yes=args.yes, version=version)
+    dur = min(args.dur, 5) if args.quick else args.dur
+    if args.quick:
+        log("快速模式：每档 5 秒、只粗扫不细扫（拐点精度较粗）。")
+    sweep = Sweep(peer, iface, dur=dur, assume_yes=args.yes, version=version,
+                  quick=args.quick)
     res = sweep.run()
     tx_bytes, rx_bytes = sweep.traffic_used()
     elapsed = time.time() - started
