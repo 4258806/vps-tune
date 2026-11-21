@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-vps-test.py — VPS 验货工具 v2.0.1（“测”+“调”）
+vps-test.py — VPS 验货工具 v2.0.2（“测”+“调”）
 
 公开项目，给国内买 VPS 的人用。一键测出这台 VPS 的真实带宽、
 有没有限速器、限速器在哪、链路干不干净、抖动大不大，最后给一句人话结论。
@@ -35,7 +35,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "2.0.1"
+VERSION = "2.0.2"
 
 # 丢包率阈值（%）：超过即判定限速器介入。
 # 依据：七组真实数据回归，干净链路最高 0.0017%，撞限速器最低 1.35%，
@@ -989,11 +989,15 @@ class QdiscGuard:
             parts = line.split()
             if len(parts) < 2 or parts[0] != "qdisc":
                 continue
-            # 只看本网卡的行（qdisc show 可能带出 lo/docker0）。
-            if len(parts) < 5 or parts[3] != "dev" or parts[4] != self.iface:
+            # 只看本网卡的行：这里跑的是 tc qdisc show dev <iface>，输出
+            # 里没有 "dev <iface>"（每行直接是 "qdisc htb 1: root …" /
+            # "qdisc fq 10: parent 1:10 …"）；只有行里带 dev 且不是本
+            # 网卡时才跳过（v2.0.2，按 qdisc_root_kind 的容错写法；旧
+            # 代码要求 parts[3] 必须是 dev，两行全被跳过，快照永远 None）。
+            if len(parts) >= 5 and parts[3] == "dev" and parts[4] != self.iface:
                 continue
             if "root" in parts:
-                # qdisc htb 1: dev ens3 root ... default 0x10 ...
+                # qdisc htb 1: root ... default 0x10 ...
                 if parts[1] != "htb":
                     return None
                 if "default" in parts:
@@ -1001,9 +1005,13 @@ class QdiscGuard:
                     if di + 1 < len(parts) and parts[di + 1] == "0x10":
                         root_ok = True
                 continue
-            if len(parts) >= 7 and parts[5] == "parent" and parts[6] == "1:10":
-                # 挂在 1:10 下的叶子 qdisc
-                leaf = {"kind": parts[1]}
+            # 叶子：parent 1:10 的位置不固定（带 dev 时在 parts[5:7]，
+            # 不带 dev 时在 parts[3:5]），扫 parts 找，不用固定下标。
+            if "parent" in parts:
+                pi = parts.index("parent")
+                if pi + 1 < len(parts) and parts[pi + 1] == "1:10":
+                    # 挂在 1:10 下的叶子 qdisc
+                    leaf = {"kind": parts[1]}
                 m = re.search(r"\bmaxrate (\S+)", line)
                 if m:
                     leaf["maxrate"] = m.group(1)
