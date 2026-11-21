@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-vps-test.py — VPS 验货工具 v1.0.0（只做“测”，不做“调”）
+vps-test.py — VPS 验货工具 v1.0.2（只做“测”，不做“调”）
 
 公开项目，给国内买 VPS 的人用。一键测出这台 VPS 的真实带宽、
 有没有限速器、限速器在哪、链路干不干净，最后给一句人话结论。
+双点测：能力点（通用节点）测 VPS 自己的限速器，国内点（运营商匹配节点）测到中国的真实路径。
 
 用法（root 身份，在 VPS 上跑）：
     python3 vps-test.py                 # 全自动：识别运营商 -> 选测速点 -> 拐点扫描 -> 报告
@@ -30,7 +31,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.0.0"
+VERSION = "1.0.2"
 
 # 丢包率阈值（%）：超过即判定限速器介入。
 # 依据：七组真实数据回归，干净链路最高 0.0017%，撞限速器最低 1.35%，
@@ -520,11 +521,31 @@ def resolve_peer_versions(host):
     return versions
 
 
-def pick_peer(cli_peer=None, stack=(True, True), isp_name=None, peers=None):
-    """选测速点：先 ping 与用户运营商匹配的国内节点（测到中国的真实路径），
-    没有可用的再 ping 通用节点（洛杉矶/香港/新加坡/悉尼/东京），各取延迟低的。
+def _pick_best_in_group(group, versions):
+    """在一组测速点里 ping 一圈，取延迟最低的。返回 (host, label, version) 或 None。
+    label 里带延迟，如 "南京 电信（延迟 150.0 ms）"。"""
+    best = None
+    for host, label, _isp in group:
+        peer_versions = resolve_peer_versions(host)
+        use = [v for v in versions if v in peer_versions] or versions
+        for ver in use:
+            rtt = ping_avg(host, version=ver)
+            if rtt is not None:
+                vlabel = "IPv4" if ver == "4" else "IPv6"
+                log(f"  测速点 {label}（{host}）[{vlabel}] 延迟 {rtt:.1f} ms")
+                if best is None or rtt < best[0]:
+                    best = (rtt, host, label, ver)
+    if best is None:
+        return None
+    return best[1], f"{best[2]}（延迟 {best[0]:.1f} ms）", best[3]
 
-    返回 (host, label, version)，version 为 "4" 或 "6"。
+
+def pick_peers(cli_peer=None, stack=(True, True), isp_name=None, peers=None):
+    """双点选择（2026-11-22：一个点测不了两件事）：
+    - 能力点 cap：延迟最低的通用节点（洛杉矶/香港/新加坡/悉尼/东京），测 VPS 自己的限速器；
+    - 国内点 dom：延迟最低的运营商匹配国内节点，测到中国的真实路径；没有匹配节点时为 None。
+    返回 (cap, dom)，每项为 (host, label, version) 或 None。
+    手动指定 --peer 时只用那一个点，dom 为 None。
     """
     peers = peers if peers is not None else PEERS
     has_v4, has_v6 = stack
@@ -537,37 +558,32 @@ def pick_peer(cli_peer=None, stack=(True, True), isp_name=None, peers=None):
         # 检测不到 IP 栈：默认 IPv4，让 iperf3 自己决定。
         versions = ["4"]
     if cli_peer:
-        groups = [[(cli_peer, "手动指定", None)]]
-    elif isp_name:
-        # 先 ping 与用户运营商匹配的国内节点，整组都不可用时再 ping 通用节点。
-        groups = [
-            [p for p in peers if p[2] == isp_name],
-            [p for p in peers if p[2] is None],
-        ]
+        cap = _pick_best_in_group([(cli_peer, "手动指定", None)], versions)
+        dom = None
     else:
-        groups = [peers]
-    best = None
-    for group in groups:
-        for host, label, _isp in group:
-            peer_versions = resolve_peer_versions(host)
-            use = [v for v in versions if v in peer_versions] or versions
-            for ver in use:
-                rtt = ping_avg(host, version=ver)
-                if rtt is not None:
-                    vlabel = "IPv4" if ver == "4" else "IPv6"
-                    log(f"  测速点 {label}（{host}）[{vlabel}] 延迟 {rtt:.1f} ms")
-                    if best is None or rtt < best[0]:
-                        best = (rtt, host, label, ver)
-        if best is not None:
-            break
-    if best is None:
+        general = [p for p in peers if p[2] is None]
+        cap = _pick_best_in_group(general, versions)
+        dom = None
+        if isp_name:
+            matched = [p for p in peers if p[2] == isp_name]
+            if matched:
+                dom = _pick_best_in_group(matched, versions)
+                if dom is not None and cap is not None and dom[0] == cap[0]:
+                    dom = None  # 国内点与能力点是同一个，不重复测
+    if cap is None:
         warn("测速点都 ping 不通，默认用香港 Leaseweb。")
         default = next((p for p in peers
                         if p[0] == "speedtest.hkg12.hk.leaseweb.net"), None)
         if default is None:
             default = peers[0]
-        return default[0], default[1] + "（默认）", versions[0]
-    return best[1], f"{best[2]}（延迟 {best[0]:.1f} ms）", best[3]
+        cap = (default[0], default[1] + "（默认）", versions[0])
+    return cap, dom
+
+
+def pick_peer(cli_peer=None, stack=(True, True), isp_name=None, peers=None):
+    """兼容旧接口：只返回能力点（单点时代的用法）。新代码请用 pick_peers。"""
+    cap, _dom = pick_peers(cli_peer, stack, isp_name, peers)
+    return cap
 
 
 def read_sysctl(name):
@@ -1042,6 +1058,33 @@ def estimate_scan_traffic_gb(lo, hi, step, dur, fine_points=8):
 
 # ---------------------------------------------------------------- 拐点扫描
 
+def _iface_bytes(iface, which):
+    """读网卡计数器（tx/rx bytes），失败返回 0。"""
+    try:
+        with open(f"/sys/class/net/{iface}/statistics/{which}_bytes") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def probe_unshaped(peer, iface, dur, version="4"):
+    """只做不限速探测（不扫拐点），供国内点测到中国的路径用。
+    返回 (goodput_mbps, loss_pct)，测不到返回 None。
+    探测前切到 fq（不限速），测完由 QdiscGuard 恢复原状。
+    """
+    with QdiscGuard(iface) as guard:
+        if not guard.set_fq():
+            return None
+        for _ in range(MAX_RETRIES):
+            res = run_iperf(peer, dur, version, streams=1)
+            if res is not None:
+                gp = res["recv_mbps"]
+                loss = loss_pct(res["retrans"], res["sent_mbps"], dur)
+                return round(gp, 1), round(loss, 4)
+            time.sleep(8)
+    return None
+
+
 class Sweep:
     """拐点扫描：不限速探测 -> 估算流量 -> 粗扫 -> 细扫 -> 给出拐点。"""
 
@@ -1435,7 +1478,7 @@ def tuning_compare_lines(res, base):
 
 
 def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s,
-                 stack_text=None, version_label=None, base=None):
+                 stack_text=None, version_label=None, base=None, dom_probe=None):
     """生成干净的文字报告。"""
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = [
@@ -1447,7 +1490,7 @@ def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s,
         lines.append("本机 IP 栈：%s" % stack_text)
     if version_label:
         lines.append("测试走：%s" % version_label)
-    lines.append("测速点：%s" % peer_label)
+    lines.append("能力点：%s" % peer_label)
     if res.get("quick"):
         lines.append("模式：快速粗测（每档 5 秒、不细扫，拐点精度较粗）")
     if base:
@@ -1470,6 +1513,15 @@ def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s,
             lines.append("建议整形值：%d Mbit（仅供参考，v1.0.0 不下发）" % res["recommend"])
     elif res["status"] == "no_knee":
         lines.append("限速器：未检测到")
+    if dom_probe is not None:
+        lines.append("")
+        lines.append("到国内路径（%s）：" % dom_probe["label"])
+        lines.append("  不限速送达 %.1f Mbps，丢包 %.4f%%" % (
+            dom_probe["mbps"], dom_probe["loss"]))
+        if dom_probe["loss"] <= LOSS_THRESHOLD:
+            lines.append("  链路干净。")
+        else:
+            lines.append("  丢包偏高，晚高峰可能更差。")
     lines.append("")
     lines.append("结论：" + verdict_text(res))
     lines.append("")
@@ -1482,7 +1534,7 @@ def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s,
     return "\n".join(lines) + "\n"
 
 
-def save_report(text, res):
+def save_report(text, res, dom_probe=None):
     """报告存到当前目录；历史记录存 ~/.vps-test/history.json，供下次对比。"""
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     path = os.path.join(os.getcwd(), f"vps-test-report-{stamp}.txt")
@@ -1505,6 +1557,12 @@ def save_report(text, res):
         "recommend": res.get("recommend"),
         "status": res.get("status"),
     }
+    if dom_probe is not None:
+        record["domestic"] = {
+            "label": dom_probe["label"],
+            "mbps": dom_probe["mbps"],
+            "loss": dom_probe["loss"],
+        }
     try:
         os.makedirs(HISTORY_DIR, exist_ok=True)
         history = []
@@ -1626,9 +1684,17 @@ def main(argv=None):
         log("测速节点清单拉取失败，用本地缓存。")
     log()
     log("选择测速点（ping 延迟低的优先）：")
-    peer, peer_label, version = pick_peer(args.peer, (has_v4, has_v6), isp_name, peers)
+    log("  能力点：测 VPS 自己的限速器（通用节点，延迟最低）；")
+    log("  国内点：测到中国的真实路径（运营商匹配节点，延迟最低）。")
+    cap, dom = pick_peers(args.peer, (has_v4, has_v6), isp_name, peers)
+    peer, peer_label, version = cap
     version_label = "IPv4" if version == "4" else "IPv6"
-    log(f"  选用：{peer_label}（{peer}）[{version_label}]")
+    log(f"  能力点：{peer_label}（{peer}）[{version_label}]")
+    if dom is not None:
+        dom_peer, dom_label, dom_version = dom
+        log(f"  国内点：{dom_label}（{dom_peer}）")
+    else:
+        dom_peer = None
 
     # 3. 网卡
     iface = detect_iface()
@@ -1644,7 +1710,7 @@ def main(argv=None):
     for line in baseline_lines(base):
         log(line)
 
-    # 4. 拐点扫描
+    # 4. 拐点扫描（能力点：测 VPS 自己的限速器）
     dur = min(args.dur, 5) if args.quick else args.dur
     if args.quick:
         log("快速模式：每档 5 秒、只粗扫不细扫（拐点精度较粗）。")
@@ -1653,6 +1719,27 @@ def main(argv=None):
     res = sweep.run()
     tx_bytes, rx_bytes = sweep.traffic_used()
     elapsed = time.time() - started
+
+    # 4b. 国内点探测（只做不限速探测，不扫拐点）：测到中国的真实路径。
+    # 一个点测不了两件事：能力点的限速器会被到国内的路径瓶颈盖住，
+    # 所以国内点只报路径速度和丢包，不参与拐点判定。
+    dom_probe = None
+    if dom_peer is not None and res["status"] != "cancelled":
+        dom_version = dom[2]
+        log()
+        log(f"国内点探测（{dom_label}，{dur} 秒，单流）：")
+        tx0, rx0 = _iface_bytes(iface, "tx"), _iface_bytes(iface, "rx")
+        got = probe_unshaped(dom_peer, iface, dur, dom_version)
+        tx_bytes += max(0, _iface_bytes(iface, "tx") - tx0)
+        rx_bytes += max(0, _iface_bytes(iface, "rx") - rx0)
+        elapsed = time.time() - started
+        if got is None:
+            warn("  国内点探测失败（对端可能太忙）。")
+        else:
+            dom_gp, dom_loss = got
+            dom_probe = {"peer": dom_peer, "label": dom_label,
+                         "mbps": dom_gp, "loss": dom_loss}
+            log(f"  不限速送达 {dom_gp:.1f} Mbps，丢包 {dom_loss:.4f}%")
 
     # 4b. 整形达标评估：当前整形 vs 本次实测建议值。达标就不用调。
     if res.get("knee") and res.get("recommend"):
@@ -1672,10 +1759,10 @@ def main(argv=None):
     log("结论：" + verdict_text(res))
     log("=" * 60)
     report = build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed,
-                          stack_text, version_label, base)
+                          stack_text, version_label, base, dom_probe)
     log()
     print(report)
-    save_report(report, res)
+    save_report(report, res, dom_probe)
     show_history_compare(res)
     peak_reminder()
     if not args.keep:
