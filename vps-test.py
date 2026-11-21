@@ -421,9 +421,13 @@ class QdiscGuard:
         self.saved_kind = qdisc_root_kind(self.iface)
         if self.saved_kind == "htb":
             self.saved_htb = self._snapshot_htb()
-        for sig in (signal.SIGINT, signal.SIGTERM):
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             try:
-                self._old_handlers[sig] = signal.getsignal(sig)
+                old = signal.getsignal(sig)
+                self._old_handlers[sig] = old
+                if sig == signal.SIGHUP and old == signal.SIG_IGN:
+                    # nohup 下已忽略 SIGHUP：保持忽略，让扫描在后台跑完。
+                    continue
                 signal.signal(sig, self._on_signal)
             except (ValueError, OSError):
                 pass
@@ -530,8 +534,12 @@ class QdiscGuard:
 
     def _on_signal(self, signum, _frame):
         self.restore()
-        print()
-        warn("已中断，qdisc 已恢复。")
+        try:
+            # SIGHUP 时 stdout 可能已死（SSH 断了）：写不出去就跳过。
+            print()
+            warn("已中断，qdisc 已恢复。")
+        except (BrokenPipeError, OSError):
+            pass
         sys.exit(130)
 
     def __exit__(self, *_exc):
