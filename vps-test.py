@@ -84,12 +84,22 @@ HISTORY_KEEP = 20
 
 # ---------------------------------------------------------------- 工具函数
 
+def _use_color():
+    """终端才上色；重定向/管道时保持纯文本（不污染日志）。"""
+    return sys.stdout.isatty()
+
+
+def red(text):
+    return f"\033[31m{text}\033[0m" if _use_color() else text
+
+
 def log(msg=""):
     print(msg)
 
 
 def warn(msg):
-    print(f"[!] {msg}")
+    # 警告一律红色（用户定规矩：警告、错误、不可逆操作都是红色）。
+    print(red(f"[!] {msg}"))
 
 
 def ok(msg):
@@ -265,6 +275,8 @@ def detect_isp(cli_isp=None):
     log(f"  IP：      {info['ip']}")
     log(f"  运营商：  {ISPS[isp_no][0] if isp_no else info.get('isp') or info.get('org') or '未知'}")
     log(f"  地址：    {addr or '未知'}（仅供参考，大内网下地址可能不准确）")
+    if is_dc:
+        log(red("  类型：    数据中心/云厂商 IP——你现在可能挂着梯子"))
 
     if is_dc:
         # 梯子/机房 IP：不是用户真实的本地运营商，拿它调优没有意义。
