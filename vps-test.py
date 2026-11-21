@@ -521,7 +521,11 @@ class QdiscGuard:
 
     def _snapshot_htb(self):
         """抓 htb 的关键参数。只认 tcpfit 式布局（根 handle 1:、default 0x10、
-        单 class 1:10、叶子挂在 1:10 下），对不上就返回 None。"""
+        单 class 1:10、叶子挂在 1:10 下），对不上就返回 None。
+
+        注意：rate/ceil/burst/cburst 各自独立抓（tc 显示字段顺序不固定，
+        中间可能插 quantum 等字段，绑在一起的正则会抓不到）。
+        """
         rc, out, _ = tc("class", "show", "dev", self.iface)
         if rc != 0:
             return None
@@ -530,15 +534,19 @@ class QdiscGuard:
             m = re.search(r"class htb (\S+) parent 1:", line)
             if not m:
                 continue
-            m2 = re.search(r"rate (\S+) ceil (\S+) burst (\S+) cburst (\S+)", line)
-            if not m2:
+            fields = {}
+            for key in ("rate", "ceil", "burst", "cburst"):
+                fm = re.search(r"\b" + key + r" (\S+)", line)
+                if fm:
+                    fields[key] = fm.group(1)
+            if len(fields) < 4:
                 continue
             cls = {
                 "classid": m.group(1),
-                "rate": m2.group(1),
-                "ceil": m2.group(2),
-                "burst": _strip_unit(m2.group(3)),
-                "cburst": _strip_unit(m2.group(4)),
+                "rate": fields["rate"],
+                "ceil": fields["ceil"],
+                "burst": _strip_unit(fields["burst"]),
+                "cburst": _strip_unit(fields["cburst"]),
             }
             break
         if not cls or cls["classid"] != "1:10":
@@ -567,13 +575,13 @@ class QdiscGuard:
             if len(parts) >= 7 and parts[5] == "parent" and parts[6] == "1:10":
                 # 挂在 1:10 下的叶子 qdisc
                 leaf = {"kind": parts[1]}
-                m = re.search(r"maxrate (\S+)", line)
+                m = re.search(r"\bmaxrate (\S+)", line)
                 if m:
                     leaf["maxrate"] = m.group(1)
-                m = re.search(r"limit (\S+)", line)
+                m = re.search(r"\blimit (\S+)", line)
                 if m:
                     leaf["limit"] = _strip_unit(m.group(1))
-                m = re.search(r"flow_limit (\S+)", line)
+                m = re.search(r"\bflow_limit (\S+)", line)
                 if m:
                     leaf["flow_limit"] = _strip_unit(m.group(1))
         if not root_ok or not leaf:
