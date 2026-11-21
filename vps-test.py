@@ -22,7 +22,6 @@ import ipaddress
 import json
 import os
 import re
-import shutil
 import signal
 import socket
 import subprocess
@@ -1364,19 +1363,16 @@ def show_history_compare(res):
 
 
 def self_cleanup():
-    """跑完自动清除本工具：删脚本自身 + 历史记录。报告文件保留
-    （它是本次测试的凭证）。"""
+    """跑完自动清除本工具：只删脚本自身。报告和历史记录保留——
+    报告是本次测试的凭证，历史记录供下次自动对比（删了它对比功能就永远触发不了）。"""
     cleaned = []
     try:
         os.remove(os.path.abspath(__file__))
         cleaned.append("脚本")
     except OSError as exc:
         warn("脚本自删失败：" + str(exc))
-    if os.path.isdir(HISTORY_DIR):
-        shutil.rmtree(HISTORY_DIR, ignore_errors=True)
-        cleaned.append("历史记录")
     if cleaned:
-        log("已自动清除：" + "、".join(cleaned) + "（报告文件保留）。")
+        log("已自动清除：" + "、".join(cleaned) + "（报告和历史记录保留）。")
 
 
 def peak_reminder():
@@ -1404,13 +1400,9 @@ def parse_args(argv):
                         help="跑完不删除脚本和历史记录（默认自动清除，只留报告）")
     parser.add_argument("--dur", type=int, default=DEFAULT_DUR,
                         help="每个速率点测试时长（秒，默认 12，范围 5-60）")
-    parser.add_argument("--nominal", type=int, default=None,
-                        help="标称带宽（Mbit，仅用于参考，不填也可以）")
     args = parser.parse_args(argv)
     if args.dur < 5 or args.dur > 60:
         parser.error("--dur 必须是 5-60 的整数")
-    if args.nominal is not None and not 1 <= args.nominal <= 100000:
-        parser.error("--nominal 必须是 1-100000 的整数")
     if args.peer and not re.fullmatch(r"[A-Za-z0-9._:-]+", args.peer):
         parser.error("--peer 只能是主机名或 IP")
     return args
