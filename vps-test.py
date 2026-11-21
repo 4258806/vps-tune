@@ -229,20 +229,20 @@ def classify_isp(info):
 
 
 def manual_isp_menu(detected_no=None):
-    """手动选运营商。返回 1-4；选 5 直接退出。"""
+    """手动选运营商。返回 1-4；选 0 直接退出（5 也行）。"""
     log()
     log("请选择你的宽带运营商：")
     for no in sorted(ISPS):
         log(f"  {no}. {ISPS[no][0]}")
-    log("  5. 退出")
+    log("  0. 退出")
     while True:
         try:
-            ans = input("请选择 [1-5]：").strip()
+            ans = input("请选择 [0-4]：").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             warn("已取消。")
             sys.exit(1)
-        if ans == "5":
+        if ans in ("0", "5"):
             log("已退出。")
             sys.exit(0)
         if ans in ("1", "2", "3", "4"):
@@ -253,7 +253,7 @@ def manual_isp_menu(detected_no=None):
                 if not confirm("确定就用" + ISPS[no][0] + "？", default=False):
                     continue
             return no
-        log("请输入 1-5。")
+        log("请输入 0-4。")
 
 
 def detect_isp(cli_isp=None):
