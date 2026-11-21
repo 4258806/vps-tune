@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-vps-test.py — VPS 验货工具 v2.0.0（“测”+“调”）
+vps-test.py — VPS 验货工具 v2.0.1（“测”+“调”）
 
 公开项目，给国内买 VPS 的人用。一键测出这台 VPS 的真实带宽、
 有没有限速器、限速器在哪、链路干不干净、抖动大不大，最后给一句人话结论。
@@ -35,7 +35,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 
 # 丢包率阈值（%）：超过即判定限速器介入。
 # 依据：七组真实数据回归，干净链路最高 0.0017%，撞限速器最低 1.35%，
@@ -957,7 +957,10 @@ class QdiscGuard:
             return None
         cls = None
         for line in out.splitlines():
-            m = re.search(r"class htb (\S+) parent 1:", line)
+            # class 行两种写法都认：根下的 class 在 tc 里显示为
+            # "parent 1:" 或 "root"（cc-dc2 真机是 root，mock 里是
+            # parent 1:；只认一种会抓不到自己下的整形，见 v2.0.1）。
+            m = re.search(r"class htb (\S+) (?:parent 1:|root\b)", line)
             if not m:
                 continue
             fields = {}
@@ -1071,8 +1074,10 @@ class QdiscGuard:
                 pass
         return False
 
-    def restore(self):
-        """删掉测试整形器，恢复原来的根 qdisc。"""
+    def restore(self, advise_reapply=True):
+        """删掉测试整形器，恢复原来的根 qdisc。
+        advise_reapply=False 时不提示重新下发（回滚场景：用户刚亲手
+        拆了整形，再叫他下回去是错的，见 v2.0.1）。"""
         tc("qdisc", "del", "dev", self.iface, "root")
         kind = self.saved_kind
         if not kind or kind in ("noqueue", "pfifo_fast"):
@@ -1082,18 +1087,17 @@ class QdiscGuard:
             if qdisc_root_kind(self.iface) != "mq":
                 tc("qdisc", "add", "dev", self.iface, "root", "mq")
             return
+        reapply = "请重新下发原来的整形。" if advise_reapply else ""
         if kind == "htb":
             if self.saved_htb:
                 self._restore_htb()
                 if self._htb_restored_ok():
                     return
-                warn("htb 恢复校验没通过，已恢复为 fq（不限速）——"
-                     "请重新下发原来的整形。")
+                warn("htb 恢复校验没通过，已恢复为 fq（不限速）——" + reapply)
             else:
                 # 抓不到原配置：绝不能留裸 htb（没 class 会断网），
                 # 退回 fq（不限速但不断网），让用户重新下发原整形。
-                warn("原 htb 整形配置无法解析，已恢复为 fq（不限速）——"
-                     "请重新下发原来的整形。")
+                warn("原 htb 整形配置无法解析，已恢复为 fq（不限速）——" + reapply)
             tc("qdisc", "del", "dev", self.iface, "root")
             tc("qdisc", "add", "dev", self.iface, "root", "fq")
             return
@@ -1101,7 +1105,7 @@ class QdiscGuard:
             # 其他带配置的 qdisc（tbf/hfsc/netem…）：同样不留裸配置，
             # 退回 fq + 警告。
             warn(f"原 {kind} 整形配置无法完整恢复，已恢复为 fq（不限速）——"
-                 "请重新下发原来的整形。")
+                 + reapply)
             tc("qdisc", "add", "dev", self.iface, "root", "fq")
             return
         tc("qdisc", "add", "dev", self.iface, "root", kind)
@@ -1356,10 +1360,14 @@ def tuning_plan_lines(plan):
 
 def snapshot_tuning_state(iface, base, plan):
     """下发前抓原始状态，供 --rollback 恢复。返回 dict，存到快照文件。
-    qdisc：原始种类 + htb 快照（原是 htb 才有）；sysctl：要改的键的原始值。"""
-    snap = {"version": VERSION, "qdisc_kind": base.get("qdisc"), "htb": None,
+    qdisc：原始种类 + htb 快照（原是 htb 才有）；sysctl：要改的键的原始值。
+    qdisc 种类读当场 live 的值，不用开跑时的旧 base——扫描期间
+    QdiscGuard 可能已换过 qdisc，旧 base 会和下发前实际状态对不上
+    （v2.0.0 第二跑的快照就因此写成 qdisc_kind=htb、htb=null）。"""
+    live_kind = qdisc_root_kind(iface) or base.get("qdisc") or ""
+    snap = {"version": VERSION, "qdisc_kind": live_kind, "htb": None,
             "sysctl": {}}
-    if base.get("qdisc") == "htb":
+    if live_kind == "htb":
         snap["htb"] = QdiscGuard(iface)._snapshot_htb()
     for c in plan:
         if c["kind"] == "sysctl" and c.get("old") is not None:
@@ -1456,7 +1464,7 @@ def rollback_tuning(iface):
     else:
         guard.saved_kind = kind
         guard.saved_htb = snap.get("htb")
-    guard.restore()
+    guard.restore(advise_reapply=False)
     kind = qdisc_root_kind(iface)
     log(f"  根 qdisc 已恢复：{kind or '未知'}")
     # sysctl：写回原始值，删持久化文件。
