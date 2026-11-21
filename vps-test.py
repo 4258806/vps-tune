@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-vps-test.py — VPS 验货工具 v1.0.6（只做“测”，不做“调”）
+vps-test.py — VPS 验货工具 v1.0.7（只做“测”，不做“调”）
 
 公开项目，给国内买 VPS 的人用。一键测出这台 VPS 的真实带宽、
 有没有限速器、限速器在哪、链路干不干净、抖动大不大，最后给一句人话结论。
@@ -32,7 +32,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.0.6"
+VERSION = "1.0.7"
 
 # 丢包率阈值（%）：超过即判定限速器介入。
 # 依据：七组真实数据回归，干净链路最高 0.0017%，撞限速器最低 1.35%，
@@ -652,8 +652,12 @@ def mask_ip(ip):
 
 
 def _pick_best_in_group(group, versions):
-    """在一组测速点里 ping 一圈，取延迟最低的。返回 (host, label, version) 或 None。
-    label 里带延迟，如 "南京 电信（延迟 150.0 ms）"。"""
+    """在一组测速点里 ping 一圈，取延迟最低的。
+    返回 (host, label, version, rtt) 或 None。label 是干净的测速点名
+    （如“南京 电信”），不带延迟——延迟是测量值，单独返回。
+    之前标签里带延迟（“南京 电信（延迟 150.0 ms）”），导致按标签
+    比对测速点时会误判：同一台服务器两次延迟不同，标签就不同，
+    历史对比会错误地显示“测速点不同”。"""
     best = None
     for host, label, _isp, _prov in group:
         peer_versions = resolve_peer_versions(host)
@@ -667,7 +671,7 @@ def _pick_best_in_group(group, versions):
                     best = (rtt, host, label, ver)
     if best is None:
         return None
-    return best[1], f"{best[2]}（延迟 {best[0]:.1f} ms）", best[3]
+    return best[1], best[2], best[3], best[0]
 
 
 def domestic_coverage_lines(peers):
@@ -693,7 +697,9 @@ def pick_peers(cli_peer=None, stack=(True, True), isp_name=None, peers=None,
     """双点选择（2026-11-22：一个点测不了两件事）：
     - 能力点 cap：延迟最低的通用节点（洛杉矶/香港/新加坡/悉尼/东京），测 VPS 自己的限速器；
     - 国内点 dom：延迟最低的运营商匹配国内节点，测到中国的真实路径；没有匹配节点时为 None。
-    返回 (cap, dom)，每项为 (host, label, version) 或 None。
+    返回 (cap, dom)，每项为 (host, label, version, rtt) 或 None。
+    label 是干净的测速点名，不带延迟；rtt 是选点时的 ping 延迟（毫秒），
+    默认 fallback 时为 None（没 ping 过）。
     手动指定 --peer 时只用那一个点，dom 为 None。
     force_version="4"/"6" 时只考虑该 IP 版本（--ip 手动指定）；
     强制 IPv6 时国内节点大概率没有（清单里的国内节点目前都是 IPv4），dom 为 None。
@@ -730,7 +736,7 @@ def pick_peers(cli_peer=None, stack=(True, True), isp_name=None, peers=None,
                         if p[0] == "speedtest.hkg12.hk.leaseweb.net"), None)
         if default is None:
             default = peers[0]
-        cap = (default[0], default[1] + "（默认）", versions[0])
+        cap = (default[0], default[1] + "（默认）", versions[0], None)
     return cap, dom
 
 
@@ -1780,19 +1786,29 @@ def save_report(text, res, dom_probe=None):
     return path
 
 
+def _base_peer_label(label):
+    """去掉标签末尾的“（延迟 X ms）”，得到干净的测速点名。
+    兼容老历史记录（v1.0.6 及以前，标签里带延迟）与新记录（干净标签），
+    这样按标签比对测速点时，同一台服务器两次延迟不同也不会误判为换了测速点。"""
+    if not label:
+        return label
+    return re.sub(r"（延迟 [\d.]+ ms）$", "", label)
+
+
 def _dom_compare_text(dom):
     """把一条国内点记录格式化成对比用的一小段：测速点 + 速度 + 丢包。
     dom 是历史记录里的 domestic 字典或本次的 dom_probe，都是
-    label/mbps/loss 三个字段；None 表示那次没测。"""
+    label/mbps/loss 三个字段；None 表示那次没测。
+    标签先去掉末尾的延迟（老记录里带），显示和比对都用干净的测速点名。"""
     if dom is None:
         return "未测"
     mbps = dom.get("mbps")
     if mbps is None:
-        return "%s 未测出速度" % dom.get("label", "?")
+        return "%s 未测出速度" % _base_peer_label(dom.get("label", "?"))
     loss = dom.get("loss")
     if loss is None:
         loss = 0
-    return "%s %.1f Mbps、丢包 %.4f%%" % (dom.get("label", "?"), mbps, loss)
+    return "%s %.1f Mbps、丢包 %.4f%%" % (_base_peer_label(dom.get("label", "?")), mbps, loss)
 
 
 def show_history_compare(res, dom_probe=None):
@@ -1820,7 +1836,7 @@ def show_history_compare(res, dom_probe=None):
     if prev_dom is not None or dom_probe is not None:
         note = ""
         if (prev_dom is not None and dom_probe is not None
-                and prev_dom.get("label") != dom_probe.get("label")):
+                and _base_peer_label(prev_dom.get("label")) != _base_peer_label(dom_probe.get("label"))):
             note = "（测速点不同）"
         log("  国内点：上次 %s；这次 %s%s" % (
             _dom_compare_text(prev_dom), _dom_compare_text(dom_probe), note))
@@ -1928,16 +1944,18 @@ def main(argv=None):
     log("  国内点：测到中国的真实路径（运营商匹配节点，延迟最低）。")
     cap, dom = pick_peers(args.peer, (has_v4, has_v6), isp_name, peers,
                           force_version=args.ip)
-    peer, peer_label, version = cap
+    peer, peer_label, version, cap_rtt = cap
     version_label = "IPv4" if version == "4" else "IPv6"
     if args.ip:
         version_label += "（手动指定）"
-    log(f"  能力点：{peer_label}（{mask_ip(peer)}）[{version_label}]")
+    cap_rtt_txt = "（延迟 %.1f ms）" % cap_rtt if cap_rtt is not None else ""
+    log(f"  能力点：{peer_label}{cap_rtt_txt}（{mask_ip(peer)}）[{version_label}]")
     if dom is not None:
-        dom_peer, dom_label, dom_version = dom
+        dom_peer, dom_label, dom_version, dom_rtt = dom
         dom_skip_reason = None
         dom_provider = next((p[3] for p in peers if p[0] == dom_peer), "")
-        dom_label_full = dom_label + ("（%s 提供）" % dom_provider if dom_provider else "")
+        dom_rtt_txt = "（延迟 %.1f ms）" % dom_rtt if dom_rtt is not None else ""
+        dom_label_full = dom_label + dom_rtt_txt + ("（%s 提供）" % dom_provider if dom_provider else "")
         log(f"  国内点：{dom_label_full}（{mask_ip(dom_peer)}）")
     else:
         dom_peer = None
