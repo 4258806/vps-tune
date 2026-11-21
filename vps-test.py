@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-vps-test.py — VPS 验货工具 v1.0.4（只做“测”，不做“调”）
+vps-test.py — VPS 验货工具 v1.0.5（只做“测”，不做“调”）
 
 公开项目，给国内买 VPS 的人用。一键测出这台 VPS 的真实带宽、
 有没有限速器、限速器在哪、链路干不干净、抖动大不大，最后给一句人话结论。
@@ -32,7 +32,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 
 # 丢包率阈值（%）：超过即判定限速器介入。
 # 依据：七组真实数据回归，干净链路最高 0.0017%，撞限速器最低 1.35%，
@@ -88,6 +88,29 @@ PEER_PROVIDER_ISP = {
     "China Mobile": "移动",
     "China Unicom": "联通",
     "China Broadcasting": "广电",
+}
+
+# API 的 SITE 是英文城市名，统一转中文（覆盖行、选点、报告都用中文）。
+# 不在表里的原样保留（将来清单里出现新城市时再补）。
+CITY_ZH = {
+    "Beijing": "北京", "Shanghai": "上海", "Guangzhou": "广州",
+    "Shenzhen": "深圳", "Chengdu": "成都", "Chongqing": "重庆",
+    "Wuhan": "武汉", "Xi'an": "西安", "Hangzhou": "杭州",
+    "Nanjing": "南京", "Tianjin": "天津", "Suzhou": "苏州",
+    "Zhengzhou": "郑州", "Changsha": "长沙", "Ningbo": "宁波",
+    "Qingdao": "青岛", "Fuzhou": "福州", "Xiamen": "厦门",
+    "Hefei": "合肥", "Jinan": "济南", "Harbin": "哈尔滨",
+    "Shenyang": "沈阳", "Changchun": "长春", "Dalian": "大连",
+    "Shijiazhuang": "石家庄", "Taiyuan": "太原", "Nanchang": "南昌",
+    "Guiyang": "贵阳", "Nanning": "南宁", "Kunming": "昆明",
+    "Haikou": "海口", "Lanzhou": "兰州", "Yinchuan": "银川",
+    "Xining": "西宁", "Urumqi": "乌鲁木齐", "Hohhot": "呼和浩特",
+    "Lhasa": "拉萨", "Wuxi": "无锡", "Changzhou": "常州",
+    "Nantong": "南通", "Jiaxing": "嘉兴", "Shaoxing": "绍兴",
+    "Wenzhou": "温州", "Quanzhou": "泉州", "Dongguan": "东莞",
+    "Foshan": "佛山", "Zhuhai": "珠海", "Huizhou": "惠州",
+    "Zhongshan": "中山", "Shantou": "汕头", "Baotou": "包头",
+    "Luoyang": "洛阳", "Yantai": "烟台", "Weifang": "潍坊",
 }
 
 
@@ -180,6 +203,7 @@ def fetch_peers_from_api(timeout=PEERS_API_TIMEOUT):
                 continue
             isp_tag = ISPS[isp_no][0]
         site = str(entry.get("SITE") or "").strip() or "国内"
+        site = CITY_ZH.get(site, site)  # 城市名统一中文；不在表里的原样保留
         peers.append((host, "%s %s" % (site, isp_tag), isp_tag, provider))
     return peers
 
