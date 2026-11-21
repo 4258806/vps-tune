@@ -237,6 +237,15 @@ def red(text):
     return f"\033[31m{text}\033[0m" if _use_color() else text
 
 
+def green(text):
+    return f"\033[32m{text}\033[0m" if _use_color() else text
+
+
+def _strip_ansi(text):
+    """去掉 ANSI 颜色码（报告存文件时用，文件里保持纯文本）。"""
+    return re.sub(r"\033\[[0-9;]*m", "", text)
+
+
 def log(msg=""):
     print(msg)
 
@@ -1471,10 +1480,12 @@ def verdict_text(res):
 
 def tuning_compare_lines(res, base):
     """调优前后对比。当前版本只测不调，所以“调优后”是按建议值整形后的预期，
-    不是实测——等“调”版本下发整形并复测后，这里会换成实测对比。"""
+    不是实测——等“调”版本下发整形并复测后，这里会换成实测对比。
+    颜色（终端才上色，存文件时去掉）：调优前红色（当前状态、有丢包），
+    调优后绿色（预期改善）；已达标/无需整形的好状态也是绿色。"""
     lines = ["调优前后对比："]
     if res["status"] == "no_knee":
-        lines.append("  未检测到限速器，链路干净，无需整形。")
+        lines.append(green("  未检测到限速器，链路干净，无需整形。"))
         return lines
     if not res.get("knee"):
         lines.append("  本次未测出拐点，无法对比。")
@@ -1487,13 +1498,13 @@ def tuning_compare_lines(res, base):
     if base and base.get("qdisc") == "htb":
         cur = parse_rate_mbit(base.get("htb_rate"))
     if res.get("shaping_status") == "ok":
-        lines.append(f"  当前整形 {cur} Mbit 已达标，无需调整。")
+        lines.append(green(f"  当前整形 {cur} Mbit 已达标，无需调整。"))
         return lines
     before = f"整形 {cur} Mbit" if cur is not None else "无整形"
-    lines.append(f"  调优前（当前）：{before}，实测上限 {knee} Mbit，"
-                 f"不限速送达 {unshaped:.1f} Mbps、丢包 {loss:.4f}%")
-    lines.append(f"  调优后（建议整形 {rec} Mbit，预期）："
-                 f"送达约 {rec} Mbit，丢包约 0%（不再撞限速器）")
+    lines.append(red(f"  调优前（当前）：{before}，实测上限 {knee} Mbit，"
+                     f"不限速送达 {unshaped:.1f} Mbps、丢包 {loss:.4f}%"))
+    lines.append(green(f"  调优后（建议整形 {rec} Mbit，预期）："
+                       f"送达约 {rec} Mbit，丢包约 0%（不再撞限速器）"))
     return lines
 
 
@@ -1564,7 +1575,7 @@ def save_report(text, res, dom_probe=None):
         n += 1
     try:
         with open(path, "w", encoding="utf-8") as f:
-            f.write(text)
+            f.write(_strip_ansi(text))  # 文件里不带 ANSI 颜色码，保持纯文本
         ok("报告已保存：" + path)
     except OSError as exc:
         warn("报告保存失败：" + str(exc))
