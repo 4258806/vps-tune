@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-vps-test.py — VPS 验货工具 v1.0.10（只做“测”，不做“调”）
+vps-test.py — VPS 验货工具 v2.0.0（“测”+“调”）
 
 公开项目，给国内买 VPS 的人用。一键测出这台 VPS 的真实带宽、
 有没有限速器、限速器在哪、链路干不干净、抖动大不大，最后给一句人话结论。
 双点测：能力点（通用节点）测 VPS 自己的限速器，国内点（运营商匹配节点）测到中国的真实路径。
+测完可下发调优（整形 + 基础参数），下发前会问一声，默认不改；回滚用 --rollback。
 
 用法（root 身份，在 VPS 上跑）：
-    python3 vps-test.py                 # 全自动：识别运营商 -> 选测速点 -> 拐点扫描 -> 报告
+    python3 vps-test.py                 # 全自动：识别运营商 -> 选测速点 -> 拐点扫描 -> 报告（测完问要不要调优）
     python3 vps-test.py --isp 1         # 跳过识别，直接指定运营商（1 电信 / 2 移动 / 3 联通 / 4 广电）
     python3 vps-test.py --ip 6          # 手动指定 IP 版本（只测 IPv6；默认按延迟自动选）
     python3 vps-test.py --peer <地址>   # 手动指定 iperf3 测速点
-    python3 vps-test.py --yes           # 跳过流量确认（无人值守用）
+    python3 vps-test.py --yes           # 跳过流量确认和调优确认（无人值守用）
+    python3 vps-test.py --rollback      # 回滚本工具下发的调优，恢复下发前状态（不测速）
 
 依赖：Python 3.7+ 标准库、iperf3（只当客户端）、tc（iproute2）。
-本脚本不改任何系统配置，只在扫描期间临时挂测试整形器，跑完立即恢复原状。
+测速时只在扫描期间临时挂测试整形器，跑完立即恢复原状；调优（整形 + sysctl）
+只在用户确认后下发，下发前先存快照，--rollback 可恢复。
 """
 
 import argparse
@@ -32,7 +35,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.0.10"
+VERSION = "2.0.0"
 
 # 丢包率阈值（%）：超过即判定限速器介入。
 # 依据：七组真实数据回归，干净链路最高 0.0017%，撞限速器最低 1.35%，
@@ -275,6 +278,13 @@ HISTORY_DIR = os.path.expanduser("~/.vps-test")
 HISTORY_FILE = os.path.join(HISTORY_DIR, "history.json")
 HISTORY_KEEP = 20
 PEERS_CACHE_FILE = os.path.join(HISTORY_DIR, "peers.json")
+# v2.0 调优快照：下发前存的原始状态（qdisc + sysctl），--rollback 靠它恢复。
+TUNE_SNAPSHOT_FILE = os.path.join(HISTORY_DIR, "tune-snapshot.json")
+# v2.0 sysctl 持久化：调优的 sysctl 值写进这个文件，重启后仍生效。
+SYSCTL_PERSIST_FILE = "/etc/sysctl.d/99-vps-tune.conf"
+# v2.0 基础调优目标值：拥塞控制 BBR，缓冲 16MB（千兆级链路的经验门槛）。
+TUNE_CC = "bbr"
+TUNE_BUF = 16777216
 
 
 # ---------------------------------------------------------------- 工具函数
@@ -871,6 +881,30 @@ def _strip_unit(val):
     return val
 
 
+def apply_htb_rate(iface, rate_mbit):
+    """在网卡上挂一个 rate_mbit 的 htb 整形器（根 handle 1:、class 1:10、叶子 fq）。
+    失败返回 False。QdiscGuard 的测试整形和 v2.0 的持久下发都走这里，
+    保证两边挂的整形器结构一致（回滚时才认得出来）。"""
+    if not isinstance(rate_mbit, int) or isinstance(rate_mbit, bool) or rate_mbit <= 0:
+        return False
+    burst = max(32768, rate_mbit * 500)
+    tc("qdisc", "del", "dev", iface, "root")
+    rc, _, _ = tc("qdisc", "add", "dev", iface, "root",
+                  "handle", "1:", "htb", "default", "10")
+    if rc != 0:
+        return False
+    rc, _, _ = tc("class", "add", "dev", iface, "parent", "1:",
+                  "classid", "1:10", "htb",
+                  "rate", f"{rate_mbit}mbit", "ceil", f"{rate_mbit}mbit",
+                  "burst", str(burst), "cburst", str(burst), "quantum", "1514")
+    if rc != 0:
+        return False
+    rc, _, _ = tc("qdisc", "add", "dev", iface, "parent", "1:10",
+                  "handle", "10:", "fq", "limit", "40960",
+                  "flow_limit", "8192", "maxrate", f"{rate_mbit}mbit")
+    return rc == 0
+
+
 class QdiscGuard:
     """扫描期间临时挂测试整形器，结束（包括被中断）时恢复原状。
 
@@ -1086,22 +1120,7 @@ class QdiscGuard:
 
     def apply_rate(self, rate_mbit):
         """在网卡上挂一个 rate_mbit 的测试整形器。失败返回 False。"""
-        burst = max(32768, rate_mbit * 500)
-        tc("qdisc", "del", "dev", self.iface, "root")
-        rc, _, _ = tc("qdisc", "add", "dev", self.iface, "root",
-                      "handle", "1:", "htb", "default", "10")
-        if rc != 0:
-            return False
-        rc, _, _ = tc("class", "add", "dev", self.iface, "parent", "1:",
-                      "classid", "1:10", "htb",
-                      "rate", f"{rate_mbit}mbit", "ceil", f"{rate_mbit}mbit",
-                      "burst", str(burst), "cburst", str(burst), "quantum", "1514")
-        if rc != 0:
-            return False
-        rc, _, _ = tc("qdisc", "add", "dev", self.iface, "parent", "1:10",
-                      "handle", "10:", "fq", "limit", "40960",
-                      "flow_limit", "8192", "maxrate", f"{rate_mbit}mbit")
-        return rc == 0
+        return apply_htb_rate(self.iface, rate_mbit)
 
 
 # ---------------------------------------------------------------- iperf3
@@ -1208,6 +1227,257 @@ def shaping_status(current_mbit, knee, recommend):
         return "low", (f"当前整形 {current_mbit} Mbit 低于建议值 {recommend} Mbit，"
                        f"可放宽到 {recommend} Mbit")
     return "ok", f"当前整形 {current_mbit} Mbit 已达标，无需调整"
+
+
+# ---------------------------------------------------------------- v2.0 调优（整形 + 基础参数 + 回滚）
+
+# 只允许改这 5 个 sysctl 键（白名单）。写别的键一律拒绝，防手滑/注入。
+TUNE_SYSCTL_KEYS = {
+    "net.ipv4.tcp_congestion_control",
+    "net.core.rmem_max",
+    "net.core.wmem_max",
+    "net.ipv4.tcp_rmem",
+    "net.ipv4.tcp_wmem",
+}
+
+
+def write_sysctl(name, value):
+    """写一个 sysctl 值（只走 /proc/sys，不走 shell）。键必须在白名单里，
+    值只能是字母/数字/下划线/空格/点（tcp_rmem 这类三段值含空格），
+    含换行或 shell 字符一律拒绝。成功返回 True。"""
+    if name not in TUNE_SYSCTL_KEYS:
+        return False
+    value = str(value)
+    if not re.fullmatch(r"[A-Za-z0-9_ .]+", value):
+        return False
+    path = "/proc/sys/" + name.replace(".", "/")
+    try:
+        with open(path, "w") as f:
+            f.write(value)
+    except OSError:
+        return False
+    return True
+
+
+def persist_sysctl(changes):
+    """把改过的 sysctl 值写进 /etc/sysctl.d/99-vps-tune.conf，重启后仍生效。
+    changes 是 {key: value}。只写白名单里的键、值符合安全格式的，
+    其他一律跳过（防脏数据进持久化文件）。写失败只警告（/proc 已即时生效，
+    只是重启后会丢），不算调优失败。"""
+    lines = ["# vps-tune v2.0 调优（下发时写入，--rollback 时删除）"]
+    for key in sorted(changes):
+        val = str(changes[key])
+        if key not in TUNE_SYSCTL_KEYS:
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9_ .]+", val):
+            continue
+        lines.append(f"{key} = {val}")
+    try:
+        os.makedirs(os.path.dirname(SYSCTL_PERSIST_FILE), exist_ok=True)
+        with open(SYSCTL_PERSIST_FILE, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError as exc:
+        warn("sysctl 持久化失败（重启后会丢，需手动写 /etc/sysctl.conf）：" + str(exc))
+        return False
+    return True
+
+
+def _tcp_buf_max(val):
+    """tcp_rmem/tcp_wmem 的三段值（min default max）取 max。取不到返回 None。"""
+    if not val:
+        return None
+    try:
+        parts = str(val).split()
+        return int(parts[2]) if len(parts) >= 3 else None
+    except (ValueError, IndexError):
+        return None
+
+
+def plan_tuning(base, res):
+    """按实测结果和当前参数，列出需要调的项。返回 change 列表，每项是 dict：
+    shaping: {"kind": "shaping", "rate": 956, "desc": "..."}
+    sysctl:  {"kind": "sysctl", "key": ..., "old": ..., "new": ..., "desc": "..."}
+    qdisc:   {"kind": "qdisc", "desc": "根 qdisc：pfifo_fast → fq"}
+    全达标返回空列表。"""
+    plan = []
+    # 整形：只有测出拐点、且当前状态不是 ok 时才动。
+    recommend = res.get("recommend")
+    if res.get("knee") and recommend:
+        st = res.get("shaping_status")
+        cur = parse_rate_mbit(base.get("htb_rate")) if base.get("qdisc") == "htb" else None
+        if st == "none":
+            plan.append({"kind": "shaping", "rate": recommend,
+                         "desc": f"整形：下发 htb {recommend} Mbit（当前无整形）"})
+        elif st == "high":
+            plan.append({"kind": "shaping", "rate": recommend,
+                         "desc": f"整形：{cur} Mbit → {recommend} Mbit（当前高于实测上限，会丢包）"})
+        elif st == "low":
+            plan.append({"kind": "shaping", "rate": recommend,
+                         "desc": f"整形：{cur} Mbit → {recommend} Mbit（当前低于建议值）"})
+    shaping = any(c["kind"] == "shaping" for c in plan)
+    # 基础参数：拥塞控制 BBR、缓冲 16MB。只改不达标的。
+    cc = (base.get("cc") or "").lower()
+    if cc and not cc.startswith("bbr"):
+        plan.append({"kind": "sysctl", "key": "net.ipv4.tcp_congestion_control",
+                     "old": base.get("cc"), "new": TUNE_CC,
+                     "desc": f"拥塞控制：{base.get('cc')} → {TUNE_CC}"})
+    for key, label in (("net.core.rmem_max", "接收缓冲上限"),
+                       ("net.core.wmem_max", "发送缓冲上限")):
+        val = base.get(key.replace("net.core.", ""))
+        try:
+            cur = int(val) if val is not None else None
+        except ValueError:
+            cur = None
+        if cur is not None and cur < TUNE_BUF:
+            plan.append({"kind": "sysctl", "key": key, "old": val,
+                         "new": str(TUNE_BUF),
+                         "desc": f"{label}：{val} → {TUNE_BUF}"})
+    for key, label in (("net.ipv4.tcp_rmem", "TCP 读缓冲上限"),
+                       ("net.ipv4.tcp_wmem", "TCP 写缓冲上限")):
+        short = key.split(".")[-1]
+        mx = _tcp_buf_max(base.get(short))
+        if mx is not None and mx < TUNE_BUF:
+            parts = str(base.get(short)).split()
+            new = f"{parts[0]} {parts[1]} {TUNE_BUF}"
+            plan.append({"kind": "sysctl", "key": key, "old": base.get(short),
+                         "new": new,
+                         "desc": f"{label}：{mx} → {TUNE_BUF}"})
+    # 根 qdisc：只有不下发整形、且当前是 pfifo_fast/noqueue 时才换 fq。
+    # 下发整形时根会变成 htb（叶子就是 fq），不用再单独换。
+    if not shaping and base.get("qdisc") in ("pfifo_fast", "noqueue"):
+        plan.append({"kind": "qdisc", "desc": f"根 qdisc：{base.get('qdisc')} → fq"})
+    return plan
+
+
+def tuning_plan_lines(plan):
+    """调优方案的人话行。"""
+    return ["  " + c["desc"] for c in plan]
+
+
+def snapshot_tuning_state(iface, base, plan):
+    """下发前抓原始状态，供 --rollback 恢复。返回 dict，存到快照文件。
+    qdisc：原始种类 + htb 快照（原是 htb 才有）；sysctl：要改的键的原始值。"""
+    snap = {"version": VERSION, "qdisc_kind": base.get("qdisc"), "htb": None,
+            "sysctl": {}}
+    if base.get("qdisc") == "htb":
+        snap["htb"] = QdiscGuard(iface)._snapshot_htb()
+    for c in plan:
+        if c["kind"] == "sysctl" and c.get("old") is not None:
+            snap["sysctl"][c["key"]] = c["old"]
+    return snap
+
+
+def save_tune_snapshot(snap):
+    """快照写文件。写失败返回 False（此时绝不能下发，否则回滚不了）。"""
+    try:
+        os.makedirs(HISTORY_DIR, exist_ok=True)
+        with open(TUNE_SNAPSHOT_FILE, "w", encoding="utf-8") as f:
+            json.dump(snap, f, ensure_ascii=False, indent=2)
+    except OSError as exc:
+        warn("调优快照保存失败（无法回滚，已停止下发）：" + str(exc))
+        return False
+    return True
+
+
+def htb_applied_ok(iface, rate_mbit):
+    """校验整形是否生效：根是 htb，且 class 1:10 的 rate 就是下发的值。"""
+    if qdisc_root_kind(iface) != "htb":
+        return False
+    rc, out, _ = tc("class", "show", "dev", iface)
+    if rc != 0:
+        return False
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] == "class" and parts[2] == "1:10":
+            m = re.search(r"\brate (\S+)", line)
+            if m and parse_rate_mbit(m.group(1)) == rate_mbit:
+                return True
+    return False
+
+
+def apply_tuning(iface, base, plan):
+    """按方案下发调优。先存快照（存不上就停手），再逐项下发并校验。
+    返回 [(desc, ok)]。单项失败不中断后面的，最后如实汇报。"""
+    snap = snapshot_tuning_state(iface, base, plan)
+    if not save_tune_snapshot(snap):
+        return []
+    results = []
+    sysctl_new = {}
+    for c in plan:
+        if c["kind"] == "shaping":
+            ok_flag = apply_htb_rate(iface, c["rate"])
+            if ok_flag:
+                ok_flag = htb_applied_ok(iface, c["rate"])
+            results.append((c["desc"], ok_flag))
+            if not ok_flag:
+                warn("整形下发失败（htb 未生效）。")
+        elif c["kind"] == "sysctl":
+            ok_flag = write_sysctl(c["key"], c["new"])
+            if ok_flag:
+                sysctl_new[c["key"]] = c["new"]
+            results.append((c["desc"], ok_flag))
+            if not ok_flag:
+                warn(f"sysctl 下发失败：{c['key']}（内核可能不支持该值）。")
+        elif c["kind"] == "qdisc":
+            tc("qdisc", "del", "dev", iface, "root")
+            rc, _, _ = tc("qdisc", "add", "dev", iface, "root", "fq")
+            ok_flag = rc == 0 and qdisc_root_kind(iface) == "fq"
+            results.append((c["desc"], ok_flag))
+            if not ok_flag:
+                warn("根 qdisc 换 fq 失败。")
+    if sysctl_new:
+        persist_sysctl(sysctl_new)
+    return results
+
+
+def rollback_tuning(iface):
+    """--rollback：把本工具下发的调优全部恢复。读快照文件，
+    qdisc 按快照原样恢复（htb 按快照重建，抓不到就退 fq + 警告），
+    sysctl 写回原始值并删持久化文件，最后删快照。无快照返回 False。"""
+    try:
+        with open(TUNE_SNAPSHOT_FILE, encoding="utf-8") as f:
+            snap = json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError):
+        warn("没有调优快照（~/.vps-test/tune-snapshot.json），无需回滚。")
+        return False
+    if not isinstance(snap, dict):
+        warn("调优快照损坏，无法回滚。")
+        return False
+    log("正在回滚调优（恢复下发前状态）……")
+    # qdisc：按快照原样恢复，复用 QdiscGuard.restore() 的逻辑。
+    # 快照里的 qdisc 种类必须像个 qdisc 名（字母/数字/下划线），否则不认
+    # （防脏快照），退回 fq。tc 走 subprocess 列表、无 shell，脏值本身注不进去。
+    kind = snap.get("qdisc_kind") or ""
+    guard = QdiscGuard(iface)
+    if kind and not re.fullmatch(r"[a-z0-9_]+", kind):
+        warn(f"快照里的 qdisc 种类异常（{kind}），已恢复为 fq（不限速）。")
+        guard.saved_kind = "fq"
+        guard.saved_htb = None
+    else:
+        guard.saved_kind = kind
+        guard.saved_htb = snap.get("htb")
+    guard.restore()
+    kind = qdisc_root_kind(iface)
+    log(f"  根 qdisc 已恢复：{kind or '未知'}")
+    # sysctl：写回原始值，删持久化文件。
+    restored = []
+    for key, val in (snap.get("sysctl") or {}).items():
+        if write_sysctl(key, val):
+            restored.append(key)
+        else:
+            warn(f"sysctl 恢复失败：{key}（请手动检查）。")
+    try:
+        os.remove(SYSCTL_PERSIST_FILE)
+    except OSError:
+        pass
+    if restored:
+        log("  sysctl 已恢复：" + "、".join(restored))
+    try:
+        os.remove(TUNE_SNAPSHOT_FILE)
+    except OSError:
+        pass
+    ok("回滚完成。")
+    return True
 
 
 def estimate_scan_traffic_gb(lo, hi, step, dur, fine_points=8):
@@ -1582,7 +1852,7 @@ class Sweep:
             result["recommend"] = recommend
             ok(f"实测上限 {knee} Mbit，按 {knee}M 档位退 {margin} 余量"
                f" → 建议整形值 {recommend} Mbit")
-            log(f"  （v{VERSION} 只做测试，不下发整形；调优功能后续版本再加）")
+            log(f"  （测完会问要不要下发整形，默认不改；回滚用 --rollback）")
             return result
 
 
@@ -1598,11 +1868,11 @@ def verdict_text(res):
         head = f"实测上限 {res['knee']} Mbit，超过就丢包；"
         shape = res.get("shaping_text")
         if shape:
-            # 已达标时没有东西可下发，不加“暂不下发”。
-            if res.get("shaping_status") == "ok":
+            # 已达标或已下发时没有东西可下发，不加后缀；否则注明未下发。
+            if res.get("shaping_status") in ("ok", "applied"):
                 return head + shape
-            return head + shape + "（v%s 暂不下发）" % VERSION
-        return (head + f"建议整形 {res['recommend']} Mbit（v{VERSION} 暂不下发）")
+            return head + shape + "（未下发）"
+        return (head + f"建议整形 {res['recommend']} Mbit（未下发）")
     if status == "cancelled":
         return "扫描已取消，只做了不限速探测"
     if status == "inconclusive":
@@ -1624,8 +1894,9 @@ def domestic_verdict_line(dom_probe, dom_skip_reason=None):
 
 
 def tuning_compare_lines(res, base):
-    """调优前后对比。当前版本只测不调，所以“调优后”是按建议值整形后的预期，
-    不是实测——等“调”版本下发整形并复测后，这里会换成实测对比。
+    """调优前后对比。“调优后”是按建议值整形后的预期，不是实测——
+    等下发整形并复测后，这里会换成实测对比。v2.0 下发后会在“调优后”里
+    注明“已下发”，但送达/丢包仍是预期值（未复测）。
     颜色（终端才上色，存文件时去掉）：调优前红色（当前状态、有丢包），
     调优后绿色（预期改善）；已达标/无需整形的好状态也是绿色。"""
     lines = ["调优前后对比："]
@@ -1648,8 +1919,12 @@ def tuning_compare_lines(res, base):
     before = f"整形 {cur} Mbit" if cur is not None else "无整形"
     lines.append(red(f"  调优前（当前）：{before}，实测上限 {knee} Mbit，"
                      f"不限速送达 {unshaped:.1f} Mbps、丢包 {loss:.4f}%"))
-    lines.append(green(f"  调优后（建议整形 {rec} Mbit，预期）："
-                       f"送达约 {rec} Mbit，丢包约 0%（不再撞限速器）"))
+    if res.get("shaping_status") == "applied":
+        lines.append(green(f"  调优后（已下发整形 {rec} Mbit）："
+                           f"送达约 {rec} Mbit，丢包约 0%（不再撞限速器）"))
+    else:
+        lines.append(green(f"  调优后（建议整形 {rec} Mbit，预期）："
+                           f"送达约 {rec} Mbit，丢包约 0%（不再撞限速器）"))
     return lines
 
 
@@ -1691,10 +1966,10 @@ def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s,
         lines.append("实测上限：%d Mbit" % res["knee"])
         shape = res.get("shaping_text")
         if shape:
-            suffix = "" if res.get("shaping_status") == "ok" else "（仅供参考，v%s 不下发）" % VERSION
+            suffix = "" if res.get("shaping_status") in ("ok", "applied") else "（仅供参考，未下发）"
             lines.append("整形：%s%s" % (shape, suffix))
         else:
-            lines.append("建议整形值：%d Mbit（仅供参考，v%s 不下发）" % (res["recommend"], VERSION))
+            lines.append("建议整形值：%d Mbit（仅供参考，未下发）" % res["recommend"])
     elif res["status"] == "no_knee":
         lines.append("限速器：未检测到")
     if dom_probe is not None:
@@ -1729,6 +2004,14 @@ def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s,
     dom_line = domestic_verdict_line(dom_probe, dom_skip_reason)
     if dom_line:
         lines.append(dom_line)
+    if res.get("tuning_applied") or res.get("tuning_failed"):
+        lines.append("")
+        lines.append("本次调优（v2.0 已下发）：")
+        for d in res.get("tuning_applied") or []:
+            lines.append("  已应用：" + d)
+        for d in res.get("tuning_failed") or []:
+            lines.append("  未生效：" + d)
+        lines.append("  回滚：python3 vps-test.py --rollback")
     lines.append("")
     lines.extend(tuning_compare_lines(res, base))
     lines.append("")
@@ -1882,7 +2165,9 @@ def parse_args(argv):
                              "（默认按延迟自动选，双栈机器一般选 IPv4）。"
                              "注意：国内节点目前只有 IPv4，强制 IPv6 时国内路径跳过")
     parser.add_argument("--yes", action="store_true",
-                        help="跳过流量确认（无人值守用）")
+                        help="跳过流量确认和调优确认（无人值守用）")
+    parser.add_argument("--rollback", action="store_true",
+                        help="回滚本工具下发的调优，恢复下发前状态（不测速）")
     parser.add_argument("--keep", action="store_true",
                         help="跑完不删除脚本和历史记录（默认自动清除，只留报告）")
     parser.add_argument("--dur", type=int, default=DEFAULT_DUR,
@@ -1900,9 +2185,16 @@ def parse_args(argv):
 
 def main(argv=None):
     args = parse_args(argv)
-    print(f"vps-test v{VERSION} —— VPS 验货：测真实带宽、找限速器")
-    print("（只做测试，不改任何系统配置）")
+    print(f"vps-test v{VERSION} —— VPS 验货：测真实带宽、找限速器，测完可下发调优")
+    print("（测完问一声才下发调优，默认不改系统配置；回滚用 --rollback）")
     require_root()
+    # --rollback：只做回滚，不测速；不用 iperf3，所以放 check_deps() 前面。
+    if args.rollback:
+        iface = detect_iface()
+        if not iface:
+            warn("找不到默认路由网卡，无法回滚。")
+            return 1
+        return 0 if rollback_tuning(iface) else 1
     check_deps()
     started = time.time()
 
@@ -2049,6 +2341,35 @@ def main(argv=None):
             ok(txt)
         else:
             warn(txt)
+
+    # 4c. v2.0 调优：按实测结果列方案，问一声才下发，默认不改。
+    # 达标（plan 为空）就不问；--yes 跳过确认（无人值守）。
+    plan = plan_tuning(base, res)
+    if plan:
+        log()
+        log("调优方案（按本次实测）：")
+        for line in tuning_plan_lines(plan):
+            log(line)
+        do_tune = args.yes or confirm("是否应用以上调优？", default=False)
+        if do_tune:
+            results = apply_tuning(iface, base, plan)
+            if results:
+                log()
+                for desc, ok_flag in results:
+                    if ok_flag:
+                        ok("已应用：" + desc)
+                    else:
+                        warn("未生效：" + desc)
+                res["tuning_applied"] = [d for d, f in results if f]
+                res["tuning_failed"] = [d for d, f in results if not f]
+                # 整形已下发：报告里的整形状态改为已下发。
+                if any(c["kind"] == "shaping" for c in plan):
+                    res["shaping_text"] = f"已下发整形 {res['recommend']} Mbit（本次调优）"
+                    res["shaping_status"] = "applied"
+            else:
+                log("调优未下发（快照保存失败，系统未改动）。")
+        else:
+            log("已跳过调优（系统未改动）。")
 
     # 5. 报告
     log()
