@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-vps-test.py — VPS 验货工具 v1.0.9（只做“测”，不做“调”）
+vps-test.py — VPS 验货工具 v1.0.10（只做“测”，不做“调”）
 
 公开项目，给国内买 VPS 的人用。一键测出这台 VPS 的真实带宽、
 有没有限速器、限速器在哪、链路干不干净、抖动大不大，最后给一句人话结论。
@@ -32,7 +32,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.0.9"
+VERSION = "1.0.10"
 
 # 丢包率阈值（%）：超过即判定限速器介入。
 # 依据：七组真实数据回归，干净链路最高 0.0017%，撞限速器最低 1.35%，
@@ -1699,12 +1699,15 @@ def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s,
         lines.append("限速器：未检测到")
     if dom_probe is not None:
         lines.append("")
-        dom_label = dom_probe["label"]
+        dom_detail = []
         if dom_probe.get("peer"):
-            dom_label += "（%s）" % mask_ip(dom_probe["peer"])
+            dom_detail.append(mask_ip(dom_probe["peer"]))
         if dom_probe.get("provider"):
-            dom_label += "（%s 提供）" % dom_probe["provider"]
-        lines.append("到国内路径（%s）：" % dom_label)
+            dom_detail.append(dom_probe["provider"] + " 提供")
+        if dom_detail:
+            lines.append("到国内路径：%s（%s）" % (dom_probe["label"], "，".join(dom_detail)))
+        else:
+            lines.append("到国内路径：%s" % dom_probe["label"])
         dom_line = "  不限速送达 %.1f Mbps，丢包 %.4f%%" % (
             dom_probe["mbps"], dom_probe["loss"])
         if dom_probe.get("jitter") is not None:
