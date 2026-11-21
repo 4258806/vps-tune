@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-vps-test.py — VPS 验货工具 v1.0.2（只做“测”，不做“调”）
+vps-test.py — VPS 验货工具 v1.0.3（只做“测”，不做“调”）
 
 公开项目，给国内买 VPS 的人用。一键测出这台 VPS 的真实带宽、
-有没有限速器、限速器在哪、链路干不干净，最后给一句人话结论。
+有没有限速器、限速器在哪、链路干不干净、抖动大不大，最后给一句人话结论。
 双点测：能力点（通用节点）测 VPS 自己的限速器，国内点（运营商匹配节点）测到中国的真实路径。
 
 用法（root 身份，在 VPS 上跑）：
@@ -31,7 +31,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 
 # 丢包率阈值（%）：超过即判定限速器介入。
 # 依据：七组真实数据回归，干净链路最高 0.0017%，撞限速器最低 1.35%，
@@ -507,6 +507,38 @@ def ping_avg(host, count=3, version=None):
         return float(m.group(1))
     except ValueError:
         return None
+
+
+def ping_stats(host, count=10, version=None):
+    """ping 测延迟抖动：发 count 个包（0.2 秒间隔），返回 (avg_ms, jitter_ms, n)。
+    jitter 是 RTT 的总体标准差（毫秒），样本不足 2 个或 ping 失败返回 None。
+    version: "4" / "6" / None（默认）。"""
+    cmd = ["ping"]
+    if version == "4":
+        cmd.append("-4")
+    elif version == "6":
+        cmd.append("-6")
+    cmd += ["-i", "0.2", "-c", str(count), "-W", "2", host]
+    rc, out, _ = run_cmd(cmd, timeout=15)
+    if rc != 0:
+        return None
+    samples = [float(x) for x in re.findall(r"time=([\d.]+)\s*ms", out)]
+    if len(samples) < 2:
+        return None
+    avg = sum(samples) / len(samples)
+    var = sum((x - avg) ** 2 for x in samples) / len(samples)
+    return round(avg, 1), round(var ** 0.5, 1), len(samples)
+
+
+def jitter_note(jitter_ms):
+    """抖动定性（仅供参考）：<5 ms 稳定，5-20 ms 一般，>20 ms 偏高。"""
+    if jitter_ms is None:
+        return ""
+    if jitter_ms < 5:
+        return "抖动 %.1f ms，路径稳定。" % jitter_ms
+    if jitter_ms <= 20:
+        return "抖动 %.1f ms，一般。" % jitter_ms
+    return "抖动 %.1f ms 偏高，晚高峰可能更差。" % jitter_ms
 
 
 def detect_ip_stack():
@@ -1572,8 +1604,11 @@ def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s,
         lines.extend(baseline_lines(base))
     lines.append("")
     if res.get("unshaped_mbps") is not None:
-        lines.append("不限速探测：%.1f Mbps，丢包 %.4f%%" % (
-            res["unshaped_mbps"], res.get("unshaped_loss", 0)))
+        cap_line = "不限速探测：%.1f Mbps，丢包 %.4f%%" % (
+            res["unshaped_mbps"], res.get("unshaped_loss", 0))
+        if res.get("cap_jitter") is not None:
+            cap_line += "，抖动 %.1f ms" % res["cap_jitter"]
+        lines.append(cap_line)
     else:
         lines.append("不限速探测：未完成（%s）" % res.get("error", "未知原因"))
     if res.get("knee"):
@@ -1592,12 +1627,18 @@ def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s,
         if dom_probe.get("provider"):
             dom_label += "（%s 提供）" % dom_probe["provider"]
         lines.append("到国内路径（%s）：" % dom_label)
-        lines.append("  不限速送达 %.1f Mbps，丢包 %.4f%%" % (
-            dom_probe["mbps"], dom_probe["loss"]))
+        dom_line = "  不限速送达 %.1f Mbps，丢包 %.4f%%" % (
+            dom_probe["mbps"], dom_probe["loss"])
+        if dom_probe.get("jitter") is not None:
+            dom_line += "，抖动 %.1f ms" % dom_probe["jitter"]
+        lines.append(dom_line)
         if dom_probe["loss"] <= LOSS_THRESHOLD:
             lines.append("  链路干净。")
         else:
             lines.append("  丢包偏高，晚高峰可能更差。")
+        note = jitter_note(dom_probe.get("jitter"))
+        if note:
+            lines.append("  " + note)
     elif dom_skip_reason:
         # 国内点没测：报告里也要写明原因，不然拿到报告的人会以为漏测了。
         lines.append("")
@@ -1633,6 +1674,7 @@ def save_report(text, res, dom_probe=None):
         "time": stamp,
         "unshaped_mbps": res.get("unshaped_mbps"),
         "unshaped_loss": res.get("unshaped_loss"),
+        "cap_jitter": res.get("cap_jitter"),
         "knee": res.get("knee"),
         "recommend": res.get("recommend"),
         "status": res.get("status"),
@@ -1643,6 +1685,7 @@ def save_report(text, res, dom_probe=None):
             "mbps": dom_probe["mbps"],
             "loss": dom_probe["loss"],
             "provider": dom_probe.get("provider", ""),
+            "jitter": dom_probe.get("jitter"),
         }
     try:
         os.makedirs(HISTORY_DIR, exist_ok=True)
@@ -1821,6 +1864,13 @@ def main(argv=None):
     tx_bytes, rx_bytes = sweep.traffic_used()
     elapsed = time.time() - started
 
+    # 4a. 能力点抖动：ping 10 次算 RTT 标准差（只报路径稳定性，不参与拐点判定）。
+    if res["status"] in ("done", "no_knee"):
+        cap_j = ping_stats(peer, count=10, version=version)
+        if cap_j is not None:
+            res["cap_jitter"] = cap_j[1]
+            log(f"  能力点抖动：{cap_j[1]:.1f} ms（10 次 ping，平均延迟 {cap_j[0]:.1f} ms）")
+
     # 4b. 国内点探测（只做不限速探测，不扫拐点）：测到中国的真实路径。
     # 一个点测不了两件事：能力点的限速器会被到国内的路径瓶颈盖住，
     # 所以国内点只报路径速度和丢包，不参与拐点判定。
@@ -1841,7 +1891,12 @@ def main(argv=None):
             dom_probe = {"peer": dom_peer, "label": dom_label,
                          "mbps": dom_gp, "loss": dom_loss,
                          "provider": dom_provider}
-            log(f"  不限速送达 {dom_gp:.1f} Mbps，丢包 {dom_loss:.4f}%")
+            dom_j = ping_stats(dom_peer, count=10, version=dom_version)
+            if dom_j is not None:
+                dom_probe["jitter"] = dom_j[1]
+                log(f"  不限速送达 {dom_gp:.1f} Mbps，丢包 {dom_loss:.4f}%，抖动 {dom_j[1]:.1f} ms")
+            else:
+                log(f"  不限速送达 {dom_gp:.1f} Mbps，丢包 {dom_loss:.4f}%")
 
     # 4b. 整形达标评估：当前整形 vs 本次实测建议值。达标就不用调。
     if res.get("knee") and res.get("recommend"):
