@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-vps-test.py — VPS 验货工具 v1.0.3（只做“测”，不做“调”）
+vps-test.py — VPS 验货工具 v1.0.4（只做“测”，不做“调”）
 
 公开项目，给国内买 VPS 的人用。一键测出这台 VPS 的真实带宽、
 有没有限速器、限速器在哪、链路干不干净、抖动大不大，最后给一句人话结论。
@@ -10,6 +10,7 @@ vps-test.py — VPS 验货工具 v1.0.3（只做“测”，不做“调”）
 用法（root 身份，在 VPS 上跑）：
     python3 vps-test.py                 # 全自动：识别运营商 -> 选测速点 -> 拐点扫描 -> 报告
     python3 vps-test.py --isp 1         # 跳过识别，直接指定运营商（1 电信 / 2 移动 / 3 联通 / 4 广电）
+    python3 vps-test.py --ip 6          # 手动指定 IP 版本（只测 IPv6；默认按延迟自动选）
     python3 vps-test.py --peer <地址>   # 手动指定 iperf3 测速点
     python3 vps-test.py --yes           # 跳过流量确认（无人值守用）
 
@@ -31,7 +32,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 
 # 丢包率阈值（%）：超过即判定限速器介入。
 # 依据：七组真实数据回归，干净链路最高 0.0017%，撞限速器最低 1.35%，
@@ -605,6 +606,19 @@ def resolve_peer_versions(host):
     return versions
 
 
+def mask_ip(ip):
+    """IP 脱敏（报告和终端展示用，不存完整 IP）：
+    主机名原样返回；IPv4 只留前 3 段（122.228.230.x）；IPv6 只留前 4 组。"""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip  # 主机名，原样返回
+    if isinstance(addr, ipaddress.IPv4Address):
+        return ".".join(ip.split(".")[:3]) + ".x"
+    groups = [g.lstrip("0") or "0" for g in addr.exploded.split(":")]
+    return ":".join(groups[:4]) + ":..."
+
+
 def _pick_best_in_group(group, versions):
     """在一组测速点里 ping 一圈，取延迟最低的。返回 (host, label, version) 或 None。
     label 里带延迟，如 "南京 电信（延迟 150.0 ms）"。"""
@@ -616,7 +630,7 @@ def _pick_best_in_group(group, versions):
             rtt = ping_avg(host, version=ver)
             if rtt is not None:
                 vlabel = "IPv4" if ver == "4" else "IPv6"
-                log(f"  测速点 {label}（{host}）[{vlabel}] 延迟 {rtt:.1f} ms")
+                log(f"  测速点 {label}（{mask_ip(host)}）[{vlabel}] 延迟 {rtt:.1f} ms")
                 if best is None or rtt < best[0]:
                     best = (rtt, host, label, ver)
     if best is None:
@@ -642,23 +656,29 @@ def domestic_coverage_lines(peers):
     return lines
 
 
-def pick_peers(cli_peer=None, stack=(True, True), isp_name=None, peers=None):
+def pick_peers(cli_peer=None, stack=(True, True), isp_name=None, peers=None,
+               force_version=None):
     """双点选择（2026-11-22：一个点测不了两件事）：
     - 能力点 cap：延迟最低的通用节点（洛杉矶/香港/新加坡/悉尼/东京），测 VPS 自己的限速器；
     - 国内点 dom：延迟最低的运营商匹配国内节点，测到中国的真实路径；没有匹配节点时为 None。
     返回 (cap, dom)，每项为 (host, label, version) 或 None。
     手动指定 --peer 时只用那一个点，dom 为 None。
+    force_version="4"/"6" 时只考虑该 IP 版本（--ip 手动指定）；
+    强制 IPv6 时国内节点大概率没有（清单里的国内节点目前都是 IPv4），dom 为 None。
     """
     peers = peers if peers is not None else PEERS
     has_v4, has_v6 = stack
-    versions = []
-    if has_v4:
-        versions.append("4")
-    if has_v6:
-        versions.append("6")
-    if not versions:
-        # 检测不到 IP 栈：默认 IPv4，让 iperf3 自己决定。
-        versions = ["4"]
+    if force_version in ("4", "6"):
+        versions = [force_version]
+    else:
+        versions = []
+        if has_v4:
+            versions.append("4")
+        if has_v6:
+            versions.append("6")
+        if not versions:
+            # 检测不到 IP 栈：默认 IPv4，让 iperf3 自己决定。
+            versions = ["4"]
     if cli_peer:
         cap = _pick_best_in_group([(cli_peer, "手动指定", None, "")], versions)
         dom = None
@@ -682,9 +702,10 @@ def pick_peers(cli_peer=None, stack=(True, True), isp_name=None, peers=None):
     return cap, dom
 
 
-def pick_peer(cli_peer=None, stack=(True, True), isp_name=None, peers=None):
+def pick_peer(cli_peer=None, stack=(True, True), isp_name=None, peers=None,
+              force_version=None):
     """兼容旧接口：只返回能力点（单点时代的用法）。新代码请用 pick_peers。"""
-    cap, _dom = pick_peers(cli_peer, stack, isp_name, peers)
+    cap, _dom = pick_peers(cli_peer, stack, isp_name, peers, force_version)
     return cap
 
 
@@ -1583,8 +1604,9 @@ def tuning_compare_lines(res, base):
 
 def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s,
                  stack_text=None, version_label=None, base=None, dom_probe=None,
-                 dom_skip_reason=None):
-    """生成干净的文字报告。"""
+                 dom_skip_reason=None, cap_host=None):
+    """生成干净的文字报告。cap_host 是能力点的主机名/IP（报告里展示，
+    主机名原样显示，IP 只显示前 3 段脱敏）。"""
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = [
         "VPS 测试报告（vps-test v%s）" % VERSION,
@@ -1595,7 +1617,10 @@ def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s,
         lines.append("本机 IP 栈：%s" % stack_text)
     if version_label:
         lines.append("测试走：%s" % version_label)
-    lines.append("能力点：%s" % peer_label)
+    cap_line = "能力点：%s" % peer_label
+    if cap_host:
+        cap_line += "（%s）" % mask_ip(cap_host)
+    lines.append(cap_line)
     if res.get("quick"):
         lines.append("模式：快速粗测（每档 5 秒、不细扫，拐点精度较粗）")
     if base:
@@ -1624,6 +1649,8 @@ def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s,
     if dom_probe is not None:
         lines.append("")
         dom_label = dom_probe["label"]
+        if dom_probe.get("peer"):
+            dom_label += "（%s）" % mask_ip(dom_probe["peer"])
         if dom_probe.get("provider"):
             dom_label += "（%s 提供）" % dom_probe["provider"]
         lines.append("到国内路径（%s）：" % dom_label)
@@ -1757,6 +1784,10 @@ def parse_args(argv):
     parser.add_argument("--isp", type=int, choices=[1, 2, 3, 4],
                         help="跳过识别，直接指定运营商：1 电信 / 2 移动 / 3 联通 / 4 广电")
     parser.add_argument("--peer", help="手动指定 iperf3 测速点（主机名或 IP）")
+    parser.add_argument("--ip", choices=["4", "6"],
+                        help="手动指定 IP 版本：4 只测 IPv4，6 只测 IPv6"
+                             "（默认按延迟自动选，双栈机器一般选 IPv4）。"
+                             "注意：国内节点目前只有 IPv4，强制 IPv6 时国内路径跳过")
     parser.add_argument("--yes", action="store_true",
                         help="跳过流量确认（无人值守用）")
     parser.add_argument("--keep", action="store_true",
@@ -1799,6 +1830,13 @@ def main(argv=None):
         log(f"  IPv6：{a}")
     if not has_v4 and not has_v6:
         warn("没检测到公网 IP，测速可能失败。")
+    # --ip 手动指定版本：本机没有该版本就直接报错，别等选点时才失败。
+    if args.ip == "6" and not has_v6:
+        warn("本机没有 IPv6，不能用 --ip 6。")
+        return 1
+    if args.ip == "4" and not has_v4:
+        warn("本机没有 IPv4，不能用 --ip 4。")
+        return 1
 
     # 2. 测速点选择：先自动拉最新国内节点清单（拉不到就用缓存/硬编码）
     peers, peers_source = load_peers()
@@ -1814,28 +1852,35 @@ def main(argv=None):
     log("选择测速点（ping 延迟低的优先）：")
     log("  能力点：测 VPS 自己的限速器（通用节点，延迟最低）；")
     log("  国内点：测到中国的真实路径（运营商匹配节点，延迟最低）。")
-    cap, dom = pick_peers(args.peer, (has_v4, has_v6), isp_name, peers)
+    cap, dom = pick_peers(args.peer, (has_v4, has_v6), isp_name, peers,
+                          force_version=args.ip)
     peer, peer_label, version = cap
     version_label = "IPv4" if version == "4" else "IPv6"
-    log(f"  能力点：{peer_label}（{peer}）[{version_label}]")
+    if args.ip:
+        version_label += "（手动指定）"
+    log(f"  能力点：{peer_label}（{mask_ip(peer)}）[{version_label}]")
     if dom is not None:
         dom_peer, dom_label, dom_version = dom
         dom_skip_reason = None
         dom_provider = next((p[3] for p in peers if p[0] == dom_peer), "")
         dom_label_full = dom_label + ("（%s 提供）" % dom_provider if dom_provider else "")
-        log(f"  国内点：{dom_label_full}（{dom_peer}）")
+        log(f"  国内点：{dom_label_full}（{mask_ip(dom_peer)}）")
     else:
         dom_peer = None
         dom_provider = ""
         # 国内点没有：必须明确告诉使用者原因，不能悄悄跳过。
-        # 手动 --peer 是故意只测一个点，不提示；否则分两种情况：
+        # 手动 --peer 是故意只测一个点，不提示；否则分三种情况：
         # 1) 清单里根本没有该运营商的内地节点（移动/联通/广电现在就是这样）；
-        # 2) 有节点但都 ping 不通。
+        # 2) 强制 IPv6，但清单里的国内节点都是 IPv4，没有 IPv6 节点；
+        # 3) 有节点但都 ping 不通。
         dom_skip_reason = None
         if not args.peer and isp_name:
             matched = [p for p in peers if p[2] == isp_name]
             if not matched:
                 dom_skip_reason = "%s在内地没有公开的 iperf3 测速节点（节点清单里只有电信的 5 个）" % isp_name
+            elif args.ip == "6" and not any(
+                    "6" in resolve_peer_versions(p[0]) for p in matched):
+                dom_skip_reason = "国内节点目前只有 IPv4，没有 IPv6 节点（强制 IPv6 时国内路径跳过）"
             else:
                 dom_skip_reason = "%s的国内节点都 ping 不通" % isp_name
             warn("  [!] 国内点未测：%s，国内路径这段跳过，只测能力点（限速器/真实带宽不受影响）。" % dom_skip_reason)
@@ -1917,7 +1962,7 @@ def main(argv=None):
     log("=" * 60)
     report = build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed,
                           stack_text, version_label, base, dom_probe,
-                          dom_skip_reason=dom_skip_reason)
+                          dom_skip_reason=dom_skip_reason, cap_host=peer)
     log()
     print(report)
     save_report(report, res, dom_probe)
