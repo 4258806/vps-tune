@@ -70,6 +70,116 @@ PEERS = [
 ]
 IPERF_PORTS = [5201, 5202, 5203, 5204, 5205]
 
+# 节点清单自动拉取：iperf3serverlist.net 的 JSON API。
+# 一键命令后自动拉最新国内节点；拉不到（没网/接口挂了/改格式）就用本地缓存，再没有就用硬编码 PEERS。
+PEERS_API_URL = "https://iperf3serverlist.net/api/servers.json"
+PEERS_API_TIMEOUT = 8  # 秒
+PEERS_CACHE_MAX_AGE = 7 * 24 * 3600  # 缓存 7 天内有效
+PEERS_MIN_UPTIME = 95  # 只用 30 天在线率 >=95 的节点
+# 运营商映射：API 的 PROVIDER -> 本项目运营商名（对不上号的国内节点不用）
+PEER_PROVIDER_ISP = {
+    "China Telecom": "电信",
+    "China Mobile": "移动",
+    "China Unicom": "联通",
+    "China Broadcasting": "广电",
+}
+
+
+def _parse_peer_hostfield(field):
+    """解析 API 的 IP/HOST 字段，如 "iperf3 -c 116.169.118.91 -p 5201-5220"。
+    端口范围须包含 5201（本脚本默认先试 5201），host 须是合法 IP 或主机名。
+    返回 host，解析失败或不合要求返回 None。
+    """
+    m = re.search(r"-c\s+(\S+)\s+-p\s+(\d+)(?:-(\d+))?", field or "")
+    if not m:
+        return None
+    host = m.group(1)
+    try:
+        port_lo = int(m.group(2))
+        port_hi = int(m.group(3)) if m.group(3) else port_lo
+    except ValueError:
+        return None
+    if not (port_lo <= 5201 <= port_hi):
+        return None
+    try:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        pass
+    if re.fullmatch(r"[A-Za-z0-9.-]+", host) and "." in host and ".." not in host:
+        return host
+    return None
+
+
+def fetch_peers_from_api(timeout=PEERS_API_TIMEOUT):
+    """从 iperf3serverlist.net 拉取最新公共节点清单，只留中国内地节点。
+    返回 [(host, label, isp_tag)]，失败返回 None（调用方走缓存/硬编码）。
+    """
+    try:
+        req = urllib.request.Request(
+            PEERS_API_URL, headers={"User-Agent": "vps-test/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            if r.status != 200:
+                return None
+            data = json.load(r)
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    if not isinstance(data, list):
+        return None
+    peers = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("COUNTRY") != "CN":
+            continue
+        if entry.get("STATUS") != "green":
+            continue
+        try:
+            uptime = float(entry.get("UPTIME_30D", 0))
+        except (TypeError, ValueError):
+            continue
+        if uptime < PEERS_MIN_UPTIME:
+            continue
+        host = _parse_peer_hostfield(entry.get("IP/HOST", ""))
+        if host is None:
+            continue
+        isp_tag = PEER_PROVIDER_ISP.get(str(entry.get("PROVIDER") or "").strip())
+        if isp_tag is None:
+            continue
+        site = str(entry.get("SITE") or "").strip() or "国内"
+        peers.append((host, "%s %s" % (site, isp_tag), isp_tag))
+    return peers
+
+
+def load_peers():
+    """节点清单：API 拉最新国内节点 -> 本地缓存 -> 硬编码 PEERS。
+    返回 (peers, source)，source 为 "api" / "cache" / "builtin"。
+    通用节点（Leaseweb 等）始终用硬编码，只刷新国内节点。
+    """
+    general = [p for p in PEERS if p[2] is None]
+    fetched = fetch_peers_from_api()
+    if fetched:
+        try:
+            os.makedirs(HISTORY_DIR, exist_ok=True)
+            with open(PEERS_CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump([list(p) for p in fetched], f, ensure_ascii=False)
+        except OSError:
+            pass
+        return fetched + general, "api"
+    try:
+        if os.path.exists(PEERS_CACHE_FILE):
+            age = time.time() - os.path.getmtime(PEERS_CACHE_FILE)
+            if age < PEERS_CACHE_MAX_AGE:
+                with open(PEERS_CACHE_FILE, encoding="utf-8") as f:
+                    cached = json.load(f)
+                cn = [(p[0], p[1], p[2]) for p in cached
+                      if isinstance(p, list) and len(p) == 3]
+                if cn:
+                    return cn + general, "cache"
+    except (OSError, ValueError):
+        pass
+    return PEERS, "builtin"
+
 # 运营商：编号 -> （名称，识别关键词）
 ISPS = {
     1: ("电信", ("telecom", "chinanet")),
@@ -92,6 +202,7 @@ IP_API_TIMEOUT = 10
 HISTORY_DIR = os.path.expanduser("~/.vps-test")
 HISTORY_FILE = os.path.join(HISTORY_DIR, "history.json")
 HISTORY_KEEP = 20
+PEERS_CACHE_FILE = os.path.join(HISTORY_DIR, "peers.json")
 
 
 # ---------------------------------------------------------------- 工具函数
@@ -409,12 +520,13 @@ def resolve_peer_versions(host):
     return versions
 
 
-def pick_peer(cli_peer=None, stack=(True, True), isp_name=None):
+def pick_peer(cli_peer=None, stack=(True, True), isp_name=None, peers=None):
     """选测速点：先 ping 与用户运营商匹配的国内节点（测到中国的真实路径），
     没有可用的再 ping 通用节点（洛杉矶/香港/新加坡/悉尼/东京），各取延迟低的。
 
     返回 (host, label, version)，version 为 "4" 或 "6"。
     """
+    peers = peers if peers is not None else PEERS
     has_v4, has_v6 = stack
     versions = []
     if has_v4:
@@ -429,11 +541,11 @@ def pick_peer(cli_peer=None, stack=(True, True), isp_name=None):
     elif isp_name:
         # 先 ping 与用户运营商匹配的国内节点，整组都不可用时再 ping 通用节点。
         groups = [
-            [p for p in PEERS if p[2] == isp_name],
-            [p for p in PEERS if p[2] is None],
+            [p for p in peers if p[2] == isp_name],
+            [p for p in peers if p[2] is None],
         ]
     else:
-        groups = [PEERS]
+        groups = [peers]
     best = None
     for group in groups:
         for host, label, _isp in group:
@@ -450,7 +562,10 @@ def pick_peer(cli_peer=None, stack=(True, True), isp_name=None):
             break
     if best is None:
         warn("测速点都 ping 不通，默认用香港 Leaseweb。")
-        default = next(p for p in PEERS if p[0] == "speedtest.hkg12.hk.leaseweb.net")
+        default = next((p for p in peers
+                        if p[0] == "speedtest.hkg12.hk.leaseweb.net"), None)
+        if default is None:
+            default = peers[0]
         return default[0], default[1] + "（默认）", versions[0]
     return best[1], f"{best[2]}（延迟 {best[0]:.1f} ms）", best[3]
 
@@ -1503,10 +1618,15 @@ def main(argv=None):
     if not has_v4 and not has_v6:
         warn("没检测到公网 IP，测速可能失败。")
 
-    # 2. 测速点选择
+    # 2. 测速点选择：先自动拉最新国内节点清单（拉不到就用缓存/硬编码）
+    peers, peers_source = load_peers()
+    if peers_source == "api":
+        log("测速节点清单已自动更新（iperf3serverlist.net）。")
+    elif peers_source == "cache":
+        log("测速节点清单拉取失败，用本地缓存。")
     log()
     log("选择测速点（ping 延迟低的优先）：")
-    peer, peer_label, version = pick_peer(args.peer, (has_v4, has_v6), isp_name)
+    peer, peer_label, version = pick_peer(args.peer, (has_v4, has_v6), isp_name, peers)
     version_label = "IPv4" if version == "4" else "IPv6"
     log(f"  选用：{peer_label}（{peer}）[{version_label}]")
 
