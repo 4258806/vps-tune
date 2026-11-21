@@ -16,8 +16,7 @@ VPS 验货工具：测真实带宽、找限速器、给人话结论。给国内�
 在 VPS 上以 root 身份运行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/4258806/vps-tune/main/vps-test.py -o vps-test.py
-python3 vps-test.py
+curl -fsSL https://raw.githubusercontent.com/4258806/vps-tune/main/vps-test.py -o vps-test.py && python3 vps-test.py
 ```
 
 常用选项：
