@@ -229,8 +229,13 @@ PEERS_CACHE_FILE = os.path.join(HISTORY_DIR, "peers.json")
 # ---------------------------------------------------------------- 工具函数
 
 def _use_color():
-    """终端才上色；重定向/管道时保持纯文本（不污染日志）。"""
-    return sys.stdout.isatty()
+    """终端才上色；重定向/管道时保持纯文本（不污染日志）。
+    ANSI 颜色码是终端通用标准，不是 FinalShell 专属——PuTTY、Termius、
+    macOS 终端、iTerm2、Windows Terminal 等任何 SSH 客户端都支持。
+    TERM=dumb 的终端不支持颜色，也不上色。"""
+    if not sys.stdout.isatty():
+        return False
+    return os.environ.get("TERM", "") != "dumb"
 
 
 def red(text):
