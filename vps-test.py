@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-vps-test.py — VPS 验货工具 v1.0.5（只做“测”，不做“调”）
+vps-test.py — VPS 验货工具 v1.0.6（只做“测”，不做“调”）
 
 公开项目，给国内买 VPS 的人用。一键测出这台 VPS 的真实带宽、
 有没有限速器、限速器在哪、链路干不干净、抖动大不大，最后给一句人话结论。
@@ -32,7 +32,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.0.5"
+VERSION = "1.0.6"
 
 # 丢包率阈值（%）：超过即判定限速器介入。
 # 依据：七组真实数据回归，干净链路最高 0.0017%，撞限速器最低 1.35%，
@@ -114,6 +114,14 @@ CITY_ZH = {
 }
 
 
+def _clean_display_text(s):
+    """清洗 API 里来的展示用文本（城市名、提供方）：去掉换行和控制字符，
+    防止恶意条目往终端/报告里注入假行。只影响显示，不影响 host 校验。"""
+    if not isinstance(s, str):
+        return ""
+    return re.sub(r"[\x00-\x1f\x7f]", "", s).strip()
+
+
 def _valid_peer_host(host):
     """测速点 host 是否合法：合法 IP，或合法主机名。
     主机名只允许字母数字、点、连字符，且不能以连字符开头
@@ -189,7 +197,7 @@ def fetch_peers_from_api(timeout=PEERS_API_TIMEOUT):
         host = _parse_peer_hostfield(entry.get("IP/HOST", ""))
         if host is None:
             continue
-        provider = str(entry.get("PROVIDER") or "").strip()
+        provider = _clean_display_text(entry.get("PROVIDER"))
         isp_tag = PEER_PROVIDER_ISP.get(provider)
         if isp_tag is None:
             # 提供方不是已知的运营商（比如志愿者个人）：按 IP 的 ASN 判运营商，
@@ -202,7 +210,7 @@ def fetch_peers_from_api(timeout=PEERS_API_TIMEOUT):
             if isp_no is None:
                 continue
             isp_tag = ISPS[isp_no][0]
-        site = str(entry.get("SITE") or "").strip() or "国内"
+        site = _clean_display_text(entry.get("SITE")) or "国内"
         site = CITY_ZH.get(site, site)  # 城市名统一中文；不在表里的原样保留
         peers.append((host, "%s %s" % (site, isp_tag), isp_tag, provider))
     return peers
@@ -1596,6 +1604,19 @@ def verdict_text(res):
     return "测试未完成：" + res.get("error", "")
 
 
+def domestic_verdict_line(dom_probe, dom_skip_reason=None):
+    """结论框里的国内路径一行。测了就给测速点、速度、丢包和链路干净与否；
+    没测就写明原因，不让人以为漏测了。手动 --peer 是故意只测一个点，
+    没测速点也没原因，这时不显示这一行。"""
+    if dom_probe is not None:
+        verdict = "链路干净" if dom_probe["loss"] <= LOSS_THRESHOLD else "丢包偏高"
+        return "到国内（%s）：%.1f Mbps，丢包 %.4f%%，%s" % (
+            dom_probe["label"], dom_probe["mbps"], dom_probe["loss"], verdict)
+    if dom_skip_reason:
+        return "到国内：未测（%s）" % dom_skip_reason
+    return None
+
+
 def tuning_compare_lines(res, base):
     """调优前后对比。当前版本只测不调，所以“调优后”是按建议值整形后的预期，
     不是实测——等“调”版本下发整形并复测后，这里会换成实测对比。
@@ -1696,6 +1717,9 @@ def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s,
         lines.append("国内路径：未测（%s）。" % dom_skip_reason)
     lines.append("")
     lines.append("结论：" + verdict_text(res))
+    dom_line = domestic_verdict_line(dom_probe, dom_skip_reason)
+    if dom_line:
+        lines.append(dom_line)
     lines.append("")
     lines.extend(tuning_compare_lines(res, base))
     lines.append("")
@@ -1756,8 +1780,26 @@ def save_report(text, res, dom_probe=None):
     return path
 
 
-def show_history_compare(res):
-    """跟上次测试比一比。"""
+def _dom_compare_text(dom):
+    """把一条国内点记录格式化成对比用的一小段：测速点 + 速度 + 丢包。
+    dom 是历史记录里的 domestic 字典或本次的 dom_probe，都是
+    label/mbps/loss 三个字段；None 表示那次没测。"""
+    if dom is None:
+        return "未测"
+    mbps = dom.get("mbps")
+    if mbps is None:
+        return "%s 未测出速度" % dom.get("label", "?")
+    loss = dom.get("loss")
+    if loss is None:
+        loss = 0
+    return "%s %.1f Mbps、丢包 %.4f%%" % (dom.get("label", "?"), mbps, loss)
+
+
+def show_history_compare(res, dom_probe=None):
+    """跟上次测试比一比。能力点比不限速和拐点；国内点比测速点、速度和丢包。
+    国内点每次选的服务器可能不一样（按延迟最低选），换了就注明，
+    不然会误以为是同一条路变快/变慢了。老记录里没有 domestic 字段时，
+    上次按“未测”显示，不报错。"""
     try:
         with open(HISTORY_FILE, encoding="utf-8") as f:
             history = json.load(f)
@@ -1774,6 +1816,14 @@ def show_history_compare(res):
     log("  这次：不限速 %s Mbps，实测上限 %s" % (
         res.get("unshaped_mbps"),
         ("%s Mbit" % res["knee"]) if res.get("knee") else "未检测到限速器"))
+    prev_dom = prev.get("domestic") if isinstance(prev.get("domestic"), dict) else None
+    if prev_dom is not None or dom_probe is not None:
+        note = ""
+        if (prev_dom is not None and dom_probe is not None
+                and prev_dom.get("label") != dom_probe.get("label")):
+            note = "（测速点不同）"
+        log("  国内点：上次 %s；这次 %s%s" % (
+            _dom_compare_text(prev_dom), _dom_compare_text(dom_probe), note))
 
 
 def self_cleanup():
@@ -1983,6 +2033,9 @@ def main(argv=None):
     log()
     log("=" * 60)
     log("结论：" + verdict_text(res))
+    dom_line = domestic_verdict_line(dom_probe, dom_skip_reason)
+    if dom_line:
+        log(dom_line)
     log("=" * 60)
     report = build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed,
                           stack_text, version_label, base, dom_probe,
@@ -1990,7 +2043,7 @@ def main(argv=None):
     log()
     print(report)
     save_report(report, res, dom_probe)
-    show_history_compare(res)
+    show_history_compare(res, dom_probe)
     peak_reminder()
     if not args.keep:
         self_cleanup()
