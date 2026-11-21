@@ -574,6 +574,21 @@ def _pick_best_in_group(group, versions):
     return best[1], f"{best[2]}（延迟 {best[0]:.1f} ms）", best[3]
 
 
+def domestic_coverage_lines(peers):
+    """国内 iperf3 节点覆盖：每个运营商有没有内地节点、能不能测。
+    能测和不能测都列出来，使用者一眼就知道工具的国内覆盖范围；
+    将来清单里出现移动/联通/广电的节点，这里自动变成可测。"""
+    lines = []
+    for name in ("电信", "移动", "联通", "广电"):
+        matched = [p for p in peers if p[2] == name]
+        if matched:
+            cities = "/".join(p[1].split(" ")[0] for p in matched)
+            lines.append("  %s：%d 个（%s）可测" % (name, len(matched), cities))
+        else:
+            lines.append("  %s：无内地节点，不可测" % name)
+    return lines
+
+
 def pick_peers(cli_peer=None, stack=(True, True), isp_name=None, peers=None):
     """双点选择（2026-11-22：一个点测不了两件事）：
     - 能力点 cap：延迟最低的通用节点（洛杉矶/香港/新加坡/悉尼/东京），测 VPS 自己的限速器；
@@ -1723,6 +1738,10 @@ def main(argv=None):
         log("测速节点清单已自动更新（iperf3serverlist.net）。")
     elif peers_source == "cache":
         log("测速节点清单拉取失败，用本地缓存。")
+    log()
+    log("国内 iperf3 节点覆盖：")
+    for line in domestic_coverage_lines(peers):
+        log(line)
     log()
     log("选择测速点（ping 延迟低的优先）：")
     log("  能力点：测 VPS 自己的限速器（通用节点，延迟最低）；")
