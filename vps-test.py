@@ -585,7 +585,7 @@ def domestic_coverage_lines(peers):
             cities = "/".join(p[1].split(" ")[0] for p in matched)
             lines.append("  %s：%d 个（%s）可测" % (name, len(matched), cities))
         else:
-            lines.append("  %s：无内地节点，不可测" % name)
+            lines.append("  %s：0 个，不可测" % name)
     return lines
 
 
