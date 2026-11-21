@@ -471,20 +471,34 @@ def read_baseline(iface):
 
 
 def baseline_lines(base):
-    """未调优参数的人话行。缺失的显示未知。"""
+    """未调优参数的人话行，带达标/待优化标记。缺失的显示未知。
+    缓冲 16MB 是千兆级链路的经验门槛（BDP 约 12MB@100ms），仅供参考。"""
     def v(key):
         val = base.get(key)
         return str(val) if val is not None else "未知"
     lines = [
         f"  内核：{v('kernel')}",
-        f"  拥塞控制：{v('cc')}",
     ]
+    cc = (base.get("cc") or "").lower()
+    cc_mark = "（达标）" if cc.startswith("bbr") else ("（待优化，建议 BBR）" if cc else "")
+    lines.append(f"  拥塞控制：{v('cc')}{cc_mark}")
     qdisc = v("qdisc")
     if base.get("htb_rate"):
         qdisc += f" {base['htb_rate']}（已有整形）"
+    elif base.get("qdisc") in ("fq", "fq_codel"):
+        qdisc += "（达标）"
+    elif base.get("qdisc") in ("pfifo_fast", "noqueue"):
+        qdisc += "（待优化，建议 fq）"
     lines.append(f"  根 qdisc：{qdisc}")
-    lines.append(f"  接收缓冲上限：{v('rmem_max')}")
-    lines.append(f"  发送缓冲上限：{v('wmem_max')}")
+    for key, label in (("rmem_max", "接收缓冲上限"), ("wmem_max", "发送缓冲上限")):
+        val = base.get(key)
+        mark = ""
+        if val is not None:
+            try:
+                mark = "（达标）" if int(val) >= 16777216 else "（待优化）"
+            except ValueError:
+                pass
+        lines.append(f"  {label}：{v(key)}{mark}")
     lines.append(f"  TCP 读缓冲：{v('tcp_rmem')}")
     lines.append(f"  TCP 写缓冲：{v('tcp_wmem')}")
     lines.append(f"  MTU：{v('mtu')}")
@@ -846,6 +860,39 @@ def calc_margin(knee_mbit):
     return 40
 
 
+def parse_rate_mbit(rate_str):
+    """'946Mbit' / '946M' / '946000Kbit' / '1Gbit' -> Mbit 整数。失败返回 None。"""
+    if not rate_str:
+        return None
+    m = re.match(r"([\d.]+)\s*([KMG]?)(?:bit)?$", str(rate_str).strip(), re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        val = float(m.group(1))
+    except ValueError:
+        return None
+    unit = m.group(2).upper()
+    if unit == "K":
+        return int(round(val / 1000))
+    if unit == "G":
+        return int(round(val * 1000))
+    return int(round(val))
+
+
+def shaping_status(current_mbit, knee, recommend):
+    """整形达标判断。返回 (status, text)。
+    status: "ok"（已达标）/ "high"（太高会丢包）/ "low"（太低浪费带宽）/ "none"（没整形）。"""
+    if current_mbit is None:
+        return "none", f"建议整形 {recommend} Mbit"
+    if current_mbit > knee:
+        return "high", (f"当前整形 {current_mbit} Mbit 高于实测上限 {knee} Mbit，会丢包；"
+                        f"建议降到 {recommend} Mbit")
+    if current_mbit < recommend:
+        return "low", (f"当前整形 {current_mbit} Mbit 低于建议值 {recommend} Mbit，"
+                       f"可放宽到 {recommend} Mbit")
+    return "ok", f"当前整形 {current_mbit} Mbit 已达标，无需调整"
+
+
 def estimate_scan_traffic_gb(lo, hi, step, dur):
     """估算一次扫描的流量（GB）：粗扫各档 + 细扫上限 8 档。"""
     points = (hi - lo) // step + 2 + 8
@@ -1196,8 +1243,14 @@ def verdict_text(res):
         return (f"不限速实测 {res['unshaped_mbps']} Mbps、"
                 f"丢包 {res['unshaped_loss']}%，未检测到限速器，链路干净")
     if status == "done" and res.get("knee"):
-        return (f"实测上限 {res['knee']} Mbit，超过就丢包；"
-                f"建议整形 {res['recommend']} Mbit（v1.0.0 暂不下发）")
+        head = f"实测上限 {res['knee']} Mbit，超过就丢包；"
+        shape = res.get("shaping_text")
+        if shape:
+            # 已达标时没有东西可下发，不加“暂不下发”。
+            if res.get("shaping_status") == "ok":
+                return head + shape
+            return head + shape + "（v1.0.0 暂不下发）"
+        return (head + f"建议整形 {res['recommend']} Mbit（v1.0.0 暂不下发）")
     if status == "cancelled":
         return "扫描已取消，只做了不限速探测"
     if status == "inconclusive":
@@ -1231,7 +1284,12 @@ def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s,
         lines.append("不限速探测：未完成（%s）" % res.get("error", "未知原因"))
     if res.get("knee"):
         lines.append("实测上限：%d Mbit" % res["knee"])
-        lines.append("建议整形值：%d Mbit（仅供参考，v1.0.0 不下发）" % res["recommend"])
+        shape = res.get("shaping_text")
+        if shape:
+            suffix = "" if res.get("shaping_status") == "ok" else "（仅供参考，v1.0.0 不下发）"
+            lines.append("整形：%s%s" % (shape, suffix))
+        else:
+            lines.append("建议整形值：%d Mbit（仅供参考，v1.0.0 不下发）" % res["recommend"])
     elif res["status"] == "no_knee":
         lines.append("限速器：未检测到")
     lines.append("")
@@ -1410,6 +1468,18 @@ def main(argv=None):
     res = sweep.run()
     tx_bytes, rx_bytes = sweep.traffic_used()
     elapsed = time.time() - started
+
+    # 4b. 整形达标评估：当前整形 vs 本次实测建议值。达标就不用调。
+    if res.get("knee") and res.get("recommend"):
+        cur = parse_rate_mbit(base.get("htb_rate")) if base.get("qdisc") == "htb" else None
+        st, txt = shaping_status(cur, res["knee"], res["recommend"])
+        res["shaping_status"] = st
+        res["shaping_text"] = txt
+        log()
+        if st == "ok":
+            ok(txt)
+        else:
+            warn(txt)
 
     # 5. 报告
     log()
