@@ -430,6 +430,67 @@ def pick_peer(cli_peer=None, stack=(True, True)):
     return best[1], f"{best[2]}（延迟 {best[0]:.1f} ms）", best[3]
 
 
+def read_sysctl(name):
+    """读 /proc/sys 下的 sysctl 值。失败返回 None。"""
+    path = "/proc/sys/" + name.replace(".", "/")
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def read_baseline(iface):
+    """读未调优的系统参数（只读，供对照）。返回 dict。"""
+    base = {}
+    try:
+        base["kernel"] = os.uname().release
+    except OSError:
+        base["kernel"] = None
+    base["cc"] = read_sysctl("net.ipv4.tcp_congestion_control")
+    base["rmem_max"] = read_sysctl("net.core.rmem_max")
+    base["wmem_max"] = read_sysctl("net.core.wmem_max")
+    base["tcp_rmem"] = read_sysctl("net.ipv4.tcp_rmem")
+    base["tcp_wmem"] = read_sysctl("net.ipv4.tcp_wmem")
+    base["qdisc"] = qdisc_root_kind(iface)
+    base["htb_rate"] = None
+    if base["qdisc"] == "htb":
+        htb = QdiscGuard(iface)._snapshot_htb()
+        if htb:
+            base["htb_rate"] = htb.get("rate")
+    rc, out, _ = run_cmd(["ip", "-j", "link", "show", "dev", iface])
+    base["mtu"] = None
+    if rc == 0:
+        try:
+            data = json.loads(out)
+            if isinstance(data, list) and data and isinstance(data[0], dict):
+                base["mtu"] = data[0].get("mtu")
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return base
+
+
+def baseline_lines(base):
+    """未调优参数的人话行。缺失的显示未知。"""
+    def v(key):
+        val = base.get(key)
+        return str(val) if val is not None else "未知"
+    lines = [
+        f"  内核：{v('kernel')}",
+        f"  拥塞控制：{v('cc')}",
+    ]
+    qdisc = v("qdisc")
+    if base.get("htb_rate"):
+        qdisc += f" {base['htb_rate']}（已有整形）"
+    lines.append(f"  根 qdisc：{qdisc}")
+    lines.append(f"  接收缓冲上限：{v('rmem_max')}")
+    lines.append(f"  发送缓冲上限：{v('wmem_max')}")
+    lines.append(f"  TCP 读缓冲：{v('tcp_rmem')}")
+    lines.append(f"  TCP 写缓冲：{v('tcp_wmem')}")
+    lines.append(f"  MTU：{v('mtu')}")
+    return lines
+
+
 # ---------------------------------------------------------------- 网卡与 qdisc
 
 def detect_iface():
@@ -1145,7 +1206,7 @@ def verdict_text(res):
 
 
 def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s,
-                 stack_text=None, version_label=None):
+                 stack_text=None, version_label=None, base=None):
     """生成干净的文字报告。"""
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = [
@@ -1158,6 +1219,10 @@ def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s,
     if version_label:
         lines.append("测试走：%s" % version_label)
     lines.append("测速点：%s" % peer_label)
+    if base:
+        lines.append("")
+        lines.append("当前系统参数（未调优）：")
+        lines.extend(baseline_lines(base))
     lines.append("")
     if res.get("unshaped_mbps") is not None:
         lines.append("不限速探测：%.1f Mbps，丢包 %.4f%%" % (
@@ -1333,6 +1398,13 @@ def main(argv=None):
         return 1
     log(f"  网卡：{iface}")
 
+    # 3b. 未调优的系统参数（只读，供对照）
+    base = read_baseline(iface)
+    log()
+    log("当前系统参数（未调优，仅供对照）：")
+    for line in baseline_lines(base):
+        log(line)
+
     # 4. 拐点扫描
     sweep = Sweep(peer, iface, dur=args.dur, assume_yes=args.yes, version=version)
     res = sweep.run()
@@ -1345,7 +1417,7 @@ def main(argv=None):
     log("结论：" + verdict_text(res))
     log("=" * 60)
     report = build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed,
-                          stack_text, version_label)
+                          stack_text, version_label, base)
     log()
     print(report)
     save_report(report, res)
