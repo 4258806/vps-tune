@@ -56,18 +56,22 @@ MSS = 1448
 # 来源：tcpfit PEER_POOL（Kylin010/tcpfit）与 https://iperf3serverlist.net/api/servers.json。
 # 5 个中国电信内地节点（成都/福州/南京/宁波/郑州）2026-11-22 实测：5201 端口全通，30 天在线率 100%。
 # 三元组：(主机, 名称, 运营商标签)。标签为 None 表示通用节点（任何运营商都能用）。
+# 节点清单：(host, label, isp_tag, provider)。
+# isp_tag：国内节点所属运营商（电信/移动/联通/广电），通用节点为 None。
+# provider：免费提供该公共 iperf3 节点的商家/组织（API 的 PROVIDER 字段，
+# 公开信息，原样注明是给提供方署名，不构成任何隶属或背书）。
 PEERS = [
-    ("116.169.118.91", "成都 电信", "电信"),
-    ("59.56.22.40", "福州 电信", "电信"),
-    ("114.230.93.99", "南京 电信", "电信"),
-    ("122.228.230.122", "宁波 电信", "电信"),
-    ("123.53.44.221", "郑州 电信", "电信"),
-    ("speedtest.lax12.us.leaseweb.net", "洛杉矶 Leaseweb", None),
-    ("speedtest.hkg12.hk.leaseweb.net", "香港 Leaseweb", None),
-    ("speedtest.sin1.sg.leaseweb.net", "新加坡 Leaseweb", None),
-    ("sgp.proof.ovh.net", "新加坡 OVH", None),
-    ("speedtest.syd12.au.leaseweb.net", "悉尼 Leaseweb", None),
-    ("speedtest.tyo11.jp.leaseweb.net", "东京 Leaseweb", None),
+    ("116.169.118.91", "成都 电信", "电信", "China Telecom"),
+    ("59.56.22.40", "福州 电信", "电信", "China Telecom"),
+    ("114.230.93.99", "南京 电信", "电信", "China Telecom"),
+    ("122.228.230.122", "宁波 电信", "电信", "China Telecom"),
+    ("123.53.44.221", "郑州 电信", "电信", "China Telecom"),
+    ("speedtest.lax12.us.leaseweb.net", "洛杉矶 Leaseweb", None, "Leaseweb"),
+    ("speedtest.hkg12.hk.leaseweb.net", "香港 Leaseweb", None, "Leaseweb"),
+    ("speedtest.sin1.sg.leaseweb.net", "新加坡 Leaseweb", None, "Leaseweb"),
+    ("sgp.proof.ovh.net", "新加坡 OVH", None, "OVH"),
+    ("speedtest.syd12.au.leaseweb.net", "悉尼 Leaseweb", None, "Leaseweb"),
+    ("speedtest.tyo11.jp.leaseweb.net", "东京 Leaseweb", None, "Leaseweb"),
 ]
 IPERF_PORTS = [5201, 5202, 5203, 5204, 5205]
 
@@ -130,7 +134,8 @@ def _parse_peer_hostfield(field):
 
 def fetch_peers_from_api(timeout=PEERS_API_TIMEOUT):
     """从 iperf3serverlist.net 拉取最新公共节点清单，只留中国内地节点。
-    返回 [(host, label, isp_tag)]，失败返回 None（调用方走缓存/硬编码）。
+    返回 [(host, label, isp_tag, provider)]，失败返回 None（调用方走缓存/硬编码）。
+    provider 是 API 的 PROVIDER 字段原值（公开信息），用于给提供方署名。
     """
     try:
         req = urllib.request.Request(
@@ -160,11 +165,21 @@ def fetch_peers_from_api(timeout=PEERS_API_TIMEOUT):
         host = _parse_peer_hostfield(entry.get("IP/HOST", ""))
         if host is None:
             continue
-        isp_tag = PEER_PROVIDER_ISP.get(str(entry.get("PROVIDER") or "").strip())
+        provider = str(entry.get("PROVIDER") or "").strip()
+        isp_tag = PEER_PROVIDER_ISP.get(provider)
         if isp_tag is None:
-            continue
+            # 提供方不是已知的运营商（比如志愿者个人）：按 IP 的 ASN 判运营商，
+            # 这样志愿者架在某运营商网络上的节点也不会被丢掉。
+            # 查不到或判不出运营商的，跳过（无法归到某个运营商的国内节点组）。
+            info = lookup_ip(host)
+            if info is None:
+                continue
+            isp_no, _dc = classify_isp(info)
+            if isp_no is None:
+                continue
+            isp_tag = ISPS[isp_no][0]
         site = str(entry.get("SITE") or "").strip() or "国内"
-        peers.append((host, "%s %s" % (site, isp_tag), isp_tag))
+        peers.append((host, "%s %s" % (site, isp_tag), isp_tag, provider))
     return peers
 
 
@@ -191,10 +206,13 @@ def load_peers():
                     cached = json.load(f)
                 # 缓存是本机文件，理论上可信，但读出来仍按与 API 同样的标准校验
                 # （防文件损坏或被改写后把非法 host 送进 ping/iperf3）。
-                cn = [(p[0], p[1], p[2]) for p in cached
-                      if isinstance(p, list) and len(p) == 3
+                # 兼容旧版 3 元组缓存（无 provider，补空串）。
+                cn = [(p[0], p[1], p[2], p[3] if len(p) == 4 else "")
+                      for p in cached
+                      if isinstance(p, list) and len(p) in (3, 4)
                       and _valid_peer_host(p[0])
-                      and isinstance(p[1], str) and isinstance(p[2], str)]
+                      and isinstance(p[1], str) and isinstance(p[2], str)
+                      and (len(p) == 3 or isinstance(p[3], str))]
                 if cn:
                     return cn + general, "cache"
     except (OSError, ValueError):
@@ -559,7 +577,7 @@ def _pick_best_in_group(group, versions):
     """在一组测速点里 ping 一圈，取延迟最低的。返回 (host, label, version) 或 None。
     label 里带延迟，如 "南京 电信（延迟 150.0 ms）"。"""
     best = None
-    for host, label, _isp in group:
+    for host, label, _isp, _prov in group:
         peer_versions = resolve_peer_versions(host)
         use = [v for v in versions if v in peer_versions] or versions
         for ver in use:
@@ -575,15 +593,18 @@ def _pick_best_in_group(group, versions):
 
 
 def domestic_coverage_lines(peers):
-    """国内 iperf3 节点覆盖：每个运营商有没有内地节点、能不能测。
+    """国内 iperf3 节点覆盖：每个运营商有没有内地节点、能不能测、谁提供的。
     能测和不能测都列出来，使用者一眼就知道工具的国内覆盖范围；
-    将来清单里出现移动/联通/广电的节点，这里自动变成可测。"""
+    将来清单里出现移动/联通/广电的节点，这里自动变成可测。
+    提供方是节点清单里的公开信息（API 的 PROVIDER 字段），原样注明署名。"""
     lines = []
     for name in ("电信", "移动", "联通", "广电"):
         matched = [p for p in peers if p[2] == name]
         if matched:
             cities = "/".join(p[1].split(" ")[0] for p in matched)
-            lines.append("  %s：%d 个（%s）可测" % (name, len(matched), cities))
+            providers = sorted(set(p[3] for p in matched if p[3]))
+            suffix = "，提供方：%s" % "/".join(providers) if providers else ""
+            lines.append("  %s：%d 个（%s）可测%s" % (name, len(matched), cities, suffix))
         else:
             lines.append("  %s：0 个，不可测" % name)
     return lines
@@ -607,7 +628,7 @@ def pick_peers(cli_peer=None, stack=(True, True), isp_name=None, peers=None):
         # 检测不到 IP 栈：默认 IPv4，让 iperf3 自己决定。
         versions = ["4"]
     if cli_peer:
-        cap = _pick_best_in_group([(cli_peer, "手动指定", None)], versions)
+        cap = _pick_best_in_group([(cli_peer, "手动指定", None, "")], versions)
         dom = None
     else:
         general = [p for p in peers if p[2] is None]
@@ -1567,7 +1588,10 @@ def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s,
         lines.append("限速器：未检测到")
     if dom_probe is not None:
         lines.append("")
-        lines.append("到国内路径（%s）：" % dom_probe["label"])
+        dom_label = dom_probe["label"]
+        if dom_probe.get("provider"):
+            dom_label += "（%s 提供）" % dom_probe["provider"]
+        lines.append("到国内路径（%s）：" % dom_label)
         lines.append("  不限速送达 %.1f Mbps，丢包 %.4f%%" % (
             dom_probe["mbps"], dom_probe["loss"]))
         if dom_probe["loss"] <= LOSS_THRESHOLD:
@@ -1618,6 +1642,7 @@ def save_report(text, res, dom_probe=None):
             "label": dom_probe["label"],
             "mbps": dom_probe["mbps"],
             "loss": dom_probe["loss"],
+            "provider": dom_probe.get("provider", ""),
         }
     try:
         os.makedirs(HISTORY_DIR, exist_ok=True)
@@ -1753,9 +1778,12 @@ def main(argv=None):
     if dom is not None:
         dom_peer, dom_label, dom_version = dom
         dom_skip_reason = None
-        log(f"  国内点：{dom_label}（{dom_peer}）")
+        dom_provider = next((p[3] for p in peers if p[0] == dom_peer), "")
+        dom_label_full = dom_label + ("（%s 提供）" % dom_provider if dom_provider else "")
+        log(f"  国内点：{dom_label_full}（{dom_peer}）")
     else:
         dom_peer = None
+        dom_provider = ""
         # 国内点没有：必须明确告诉使用者原因，不能悄悄跳过。
         # 手动 --peer 是故意只测一个点，不提示；否则分两种情况：
         # 1) 清单里根本没有该运营商的内地节点（移动/联通/广电现在就是这样）；
@@ -1811,7 +1839,8 @@ def main(argv=None):
         else:
             dom_gp, dom_loss = got
             dom_probe = {"peer": dom_peer, "label": dom_label,
-                         "mbps": dom_gp, "loss": dom_loss}
+                         "mbps": dom_gp, "loss": dom_loss,
+                         "provider": dom_provider}
             log(f"  不限速送达 {dom_gp:.1f} Mbps，丢包 {dom_loss:.4f}%")
 
     # 4b. 整形达标评估：当前整形 vs 本次实测建议值。达标就不用调。
