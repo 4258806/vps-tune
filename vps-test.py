@@ -51,16 +51,22 @@ SPIKE_HITS_NEEDED = 2
 # MSS（字节），用于把重传数换算成丢包率
 MSS = 1448
 
-# 默认测速点：沿用 tcpfit 的公共 iperf3 节点池（亚太部分）。
-# 来源：tcpfit PEER_POOL（Kylin010/tcpfit），完整列表见 https://iperf3serverlist.net。
-# 注意：tcpfit 池子里也没有中国内地节点——离中国最近的稳定节点就是香港/新加坡。
+# 默认测速点：沿用 tcpfit 的公共 iperf3 节点池（亚太部分）+ iperf3serverlist.net 的中国电信节点。
+# 来源：tcpfit PEER_POOL（Kylin010/tcpfit）与 https://iperf3serverlist.net/api/servers.json。
+# 5 个中国电信内地节点（成都/福州/南京/宁波/郑州）2026-11-22 实测：5201 端口全通，30 天在线率 100%。
+# 三元组：(主机, 名称, 运营商标签)。标签为 None 表示通用节点（任何运营商都能用）。
 PEERS = [
-    ("speedtest.lax12.us.leaseweb.net", "洛杉矶 Leaseweb"),
-    ("speedtest.hkg12.hk.leaseweb.net", "香港 Leaseweb"),
-    ("speedtest.sin1.sg.leaseweb.net", "新加坡 Leaseweb"),
-    ("sgp.proof.ovh.net", "新加坡 OVH"),
-    ("speedtest.syd12.au.leaseweb.net", "悉尼 Leaseweb"),
-    ("speedtest.tyo11.jp.leaseweb.net", "东京 Leaseweb"),
+    ("116.169.118.91", "成都 电信", "电信"),
+    ("59.56.22.40", "福州 电信", "电信"),
+    ("114.230.93.99", "南京 电信", "电信"),
+    ("122.228.230.122", "宁波 电信", "电信"),
+    ("123.53.44.221", "郑州 电信", "电信"),
+    ("speedtest.lax12.us.leaseweb.net", "洛杉矶 Leaseweb", None),
+    ("speedtest.hkg12.hk.leaseweb.net", "香港 Leaseweb", None),
+    ("speedtest.sin1.sg.leaseweb.net", "新加坡 Leaseweb", None),
+    ("sgp.proof.ovh.net", "新加坡 OVH", None),
+    ("speedtest.syd12.au.leaseweb.net", "悉尼 Leaseweb", None),
+    ("speedtest.tyo11.jp.leaseweb.net", "东京 Leaseweb", None),
 ]
 IPERF_PORTS = [5201, 5202, 5203, 5204, 5205]
 
@@ -403,8 +409,9 @@ def resolve_peer_versions(host):
     return versions
 
 
-def pick_peer(cli_peer=None, stack=(True, True)):
-    """选测速点：对每个点、用本机有的每个 IP 版本 ping，取延迟低的。
+def pick_peer(cli_peer=None, stack=(True, True), isp_name=None):
+    """选测速点：先 ping 与用户运营商匹配的国内节点（测到中国的真实路径），
+    没有可用的再 ping 通用节点（洛杉矶/香港/新加坡/悉尼/东京），各取延迟低的。
 
     返回 (host, label, version)，version 为 "4" 或 "6"。
     """
@@ -417,21 +424,34 @@ def pick_peer(cli_peer=None, stack=(True, True)):
     if not versions:
         # 检测不到 IP 栈：默认 IPv4，让 iperf3 自己决定。
         versions = ["4"]
-    hosts = [(cli_peer, "手动指定")] if cli_peer else PEERS
+    if cli_peer:
+        groups = [[(cli_peer, "手动指定", None)]]
+    elif isp_name:
+        # 先 ping 与用户运营商匹配的国内节点，整组都不可用时再 ping 通用节点。
+        groups = [
+            [p for p in PEERS if p[2] == isp_name],
+            [p for p in PEERS if p[2] is None],
+        ]
+    else:
+        groups = [PEERS]
     best = None
-    for host, label in hosts:
-        peer_versions = resolve_peer_versions(host)
-        use = [v for v in versions if v in peer_versions] or versions
-        for ver in use:
-            rtt = ping_avg(host, version=ver)
-            if rtt is not None:
-                vlabel = "IPv4" if ver == "4" else "IPv6"
-                log(f"  测速点 {label}（{host}）[{vlabel}] 延迟 {rtt:.1f} ms")
-                if best is None or rtt < best[0]:
-                    best = (rtt, host, label, ver)
+    for group in groups:
+        for host, label, _isp in group:
+            peer_versions = resolve_peer_versions(host)
+            use = [v for v in versions if v in peer_versions] or versions
+            for ver in use:
+                rtt = ping_avg(host, version=ver)
+                if rtt is not None:
+                    vlabel = "IPv4" if ver == "4" else "IPv6"
+                    log(f"  测速点 {label}（{host}）[{vlabel}] 延迟 {rtt:.1f} ms")
+                    if best is None or rtt < best[0]:
+                        best = (rtt, host, label, ver)
+        if best is not None:
+            break
     if best is None:
         warn("测速点都 ping 不通，默认用香港 Leaseweb。")
-        return PEERS[1][0], PEERS[1][1] + "（默认）", versions[0]
+        default = next(p for p in PEERS if p[0] == "speedtest.hkg12.hk.leaseweb.net")
+        return default[0], default[1] + "（默认）", versions[0]
     return best[1], f"{best[2]}（延迟 {best[0]:.1f} ms）", best[3]
 
 
@@ -1486,7 +1506,7 @@ def main(argv=None):
     # 2. 测速点选择
     log()
     log("选择测速点（ping 延迟低的优先）：")
-    peer, peer_label, version = pick_peer(args.peer, (has_v4, has_v6))
+    peer, peer_label, version = pick_peer(args.peer, (has_v4, has_v6), isp_name)
     version_label = "IPv4" if version == "4" else "IPv6"
     log(f"  选用：{peer_label}（{peer}）[{version_label}]")
 
