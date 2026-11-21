@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-vps-test.py — VPS 验货工具 v1.0.7（只做“测”，不做“调”）
+vps-test.py — VPS 验货工具 v1.0.8（只做“测”，不做“调”）
 
 公开项目，给国内买 VPS 的人用。一键测出这台 VPS 的真实带宽、
 有没有限速器、限速器在哪、链路干不干净、抖动大不大，最后给一句人话结论。
@@ -32,7 +32,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.0.7"
+VERSION = "1.0.8"
 
 # 丢包率阈值（%）：超过即判定限速器介入。
 # 依据：七组真实数据回归，干净链路最高 0.0017%，撞限速器最低 1.35%，
@@ -1737,7 +1737,10 @@ def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s,
 
 
 def save_report(text, res, dom_probe=None):
-    """报告存到当前目录；历史记录存 ~/.vps-test/history.json，供下次对比。"""
+    """报告存到当前目录；历史记录存 ~/.vps-test/history.json，供下次对比。
+    返回 (报告路径, 历史是否已保存)。报告保存失败返回 (None, False)；
+    历史保存失败返回 (路径, False)——报告还在，但历史里没记这一条，
+    后面删记录时就不能删最后一条（那是上一次的），得靠这个标志区分。"""
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     path = os.path.join(os.getcwd(), f"vps-test-report-{stamp}.txt")
     n = 2
@@ -1750,7 +1753,7 @@ def save_report(text, res, dom_probe=None):
         ok("报告已保存：" + path)
     except OSError as exc:
         warn("报告保存失败：" + str(exc))
-        return None
+        return None, False
     record = {
         "time": stamp,
         "unshaped_mbps": res.get("unshaped_mbps"),
@@ -1782,8 +1785,38 @@ def save_report(text, res, dom_probe=None):
             json.dump(history, f, ensure_ascii=False, indent=2)
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         warn("历史记录保存失败：" + str(exc))
-        return path
-    return path
+        return path, False
+    return path, True
+
+
+def discard_run(report_path, history_saved):
+    """用户选择不保留本次结果：删掉本次的报告文件，并把本次刚追加的
+    历史记录删掉。只删本次的：报告按路径删（只删长得像报告的文件，
+    防止路径不对删错东西）；历史只删最后一条，而且只有本次确实
+    记进去了（history_saved）才删——不然会误删上一次的记录。
+    以前的历史记录不动，下次对比照常用更早的记录。"""
+    removed = []
+    if report_path:
+        name = os.path.basename(report_path)
+        if name.startswith("vps-test-report-") and name.endswith(".txt"):
+            try:
+                os.remove(report_path)
+                removed.append("报告")
+            except OSError as exc:
+                warn("报告删除失败：" + str(exc))
+    if history_saved:
+        try:
+            with open(HISTORY_FILE, encoding="utf-8") as f:
+                history = json.load(f)
+            if isinstance(history, list) and history:
+                history.pop()  # 最后一条就是本次刚追加的
+                with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+                    json.dump(history, f, ensure_ascii=False, indent=2)
+                removed.append("本次历史记录")
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            warn("历史记录删除失败：" + str(exc))
+    if removed:
+        log("已删除：" + "、".join(removed) + "。")
 
 
 def _base_peer_label(label):
@@ -1843,8 +1876,8 @@ def show_history_compare(res, dom_probe=None):
 
 
 def self_cleanup():
-    """跑完自动清除本工具：只删脚本自身。报告和历史记录保留——
-    报告是本次测试的凭证，历史记录供下次自动对比（删了它对比功能就永远触发不了）。"""
+    """跑完自动清除本工具：只删脚本自身。报告和历史记录由后面的
+    保留/删除询问决定（默认保留），这里不替用户做主，所以只说删了脚本。"""
     cleaned = []
     try:
         os.remove(os.path.abspath(__file__))
@@ -1852,7 +1885,7 @@ def self_cleanup():
     except OSError as exc:
         warn("脚本自删失败：" + str(exc))
     if cleaned:
-        log("已自动清除：" + "、".join(cleaned) + "（报告和历史记录保留）。")
+        log("已自动清除：" + "、".join(cleaned) + "。")
 
 
 def peak_reminder():
@@ -2060,11 +2093,17 @@ def main(argv=None):
                           dom_skip_reason=dom_skip_reason, cap_host=peer)
     log()
     print(report)
-    save_report(report, res, dom_probe)
+    report_path, history_saved = save_report(report, res, dom_probe)
     show_history_compare(res, dom_probe)
     peak_reminder()
     if not args.keep:
         self_cleanup()
+    # 跑完问一句：本次的报告和历史记录留不留。默认保留（回车即保留），
+    # 选否就把本次的报告文件和刚追加的那条历史记录删掉，以前的记录不动。
+    # --yes 或非交互时不问，直接保留。
+    if report_path and not args.yes:
+        if not confirm("是否保留本次报告和历史记录？", default=True):
+            discard_run(report_path, history_saved)
     return 0 if res["status"] in ("done", "no_knee") else 1
 
 
