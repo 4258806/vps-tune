@@ -71,6 +71,7 @@ DATACENTER_KEYWORDS = (
     "azure", "digitalocean", "vultr", "linode", "ovh", "hetzner",
     "leaseweb", "cloudflare", "datacenter", "data center", "hosting",
     "vps", "dedicated", "colocation", "idc",
+    "peg tech", "raksmart",
 )
 
 IP_API_URL = "http://ip-api.com/json/{ip}?fields=status,message,country,regionName,city,isp,org,as,query"
