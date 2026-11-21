@@ -1,0 +1,1225 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+vps-test.py — VPS 验货工具 v1.0.0（只做“测”，不做“调”）
+
+公开项目，给国内买 VPS 的人用。一键测出这台 VPS 的真实带宽、
+有没有限速器、限速器在哪、链路干不干净，最后给一句人话结论。
+
+用法（root 身份，在 VPS 上跑）：
+    python3 vps-test.py                 # 全自动：识别运营商 -> 选测速点 -> 拐点扫描 -> 报告
+    python3 vps-test.py --isp 1         # 跳过识别，直接指定运营商（1 电信 / 2 移动 / 3 联通 / 4 广电）
+    python3 vps-test.py --peer <地址>   # 手动指定 iperf3 测速点
+    python3 vps-test.py --yes           # 跳过流量确认（无人值守用）
+
+依赖：Python 3.7+ 标准库、iperf3（只当客户端）、tc（iproute2）。
+本脚本不改任何系统配置，只在扫描期间临时挂测试整形器，跑完立即恢复原状。
+"""
+
+import argparse
+import datetime
+import ipaddress
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+VERSION = "1.0.0"
+
+# 丢包率阈值（%）：超过即判定限速器介入。
+# 依据：七组真实数据回归，干净链路最高 0.0017%，撞限速器最低 1.35%，
+# 0.1% 距两侧分别有 59 倍和 13.5 倍余量。
+LOSS_THRESHOLD = 0.1
+# 每个速率点测试时长（秒）
+DEFAULT_DUR = 12
+# 两档之间的静置时间（秒），让上一条流的状态排空
+GAP = 3
+# 扫描前静置时间（秒）
+PRE_SCAN_GAP = 15
+# 扫描流量超过这个数（GB）时要用户再确认一次
+TRAFFIC_CONFIRM_GB = 50
+# iperf3 每个点最多重试次数
+MAX_RETRIES = 3
+# 跳变确认：3 次里 >= 2 次跳变才确认
+SPIKE_HITS_NEEDED = 2
+# MSS（字节），用于把重传数换算成丢包率
+MSS = 1448
+
+# 默认测速点（v1.0.0）：洛杉矶 / 东京 Leaseweb。国内节点待后续补充。
+PEERS = [
+    ("speedtest.lax12.us.leaseweb.net", "洛杉矶 Leaseweb"),
+    ("speedtest.tyo11.jp.leaseweb.net", "东京 Leaseweb"),
+]
+IPERF_PORTS = [5201, 5202, 5203, 5204, 5205]
+
+# 运营商：编号 -> （名称，识别关键词）
+ISPS = {
+    1: ("电信", ("telecom", "chinanet")),
+    2: ("移动", ("mobile", "cmnet")),
+    3: ("联通", ("unicom", "cunc", "cu-net")),
+    4: ("广电", ("broadcast", "broadnet", "cbn")),
+}
+# 数据中心 / 云厂商 / VPN 关键词：命中即判定为梯子（先排除居民宽带运营商）。
+DATACENTER_KEYWORDS = (
+    "alibaba", "tencent", "huawei", "amazon", "aws", "google", "microsoft",
+    "azure", "digitalocean", "vultr", "linode", "ovh", "hetzner",
+    "leaseweb", "cloudflare", "datacenter", "data center", "hosting",
+    "vps", "dedicated", "colocation", "idc",
+)
+
+IP_API_URL = "http://ip-api.com/json/{ip}?fields=status,message,country,regionName,city,isp,org,as,query"
+IP_API_TIMEOUT = 10
+
+HISTORY_DIR = os.path.expanduser("~/.vps-test")
+HISTORY_FILE = os.path.join(HISTORY_DIR, "history.json")
+HISTORY_KEEP = 20
+
+
+# ---------------------------------------------------------------- 工具函数
+
+def log(msg=""):
+    print(msg)
+
+
+def warn(msg):
+    print(f"[!] {msg}")
+
+
+def ok(msg):
+    print(f"[+] {msg}")
+
+
+def info(msg):
+    print(f"[*] {msg}")
+
+
+def human_bytes(n):
+    """字节数 -> 人话，如 12.75 GB / 34 MB。"""
+    if n >= 1024 ** 3:
+        return f"{n / 1024 ** 3:.2f} GB"
+    if n >= 1024 ** 2:
+        return f"{n / 1024 ** 2:.0f} MB"
+    if n >= 1024:
+        return f"{n / 1024:.0f} KB"
+    return f"{n} B"
+
+
+def run_cmd(argv, timeout=None):
+    """跑一条命令（列表参数，绝不经过 shell）。返回 (returncode, stdout, stderr)。"""
+    try:
+        proc = subprocess.run(
+            argv, capture_output=True, text=True,
+            timeout=timeout, errors="replace",
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired:
+        return -1, "", "timeout"
+    except FileNotFoundError:
+        return -1, "", "command not found"
+    except OSError as exc:
+        return -1, "", str(exc)
+
+
+def confirm(prompt, default=False):
+    """问用户 yes/no。无终端时按默认值（默认否）。"""
+    if not sys.stdin.isatty():
+        return default
+    suffix = " [Y/n] " if default else " [y/N] "
+    try:
+        ans = input(prompt + suffix).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return default
+    if not ans:
+        return default
+    return ans in ("y", "yes")
+
+
+def require_root():
+    if os.geteuid() != 0:
+        warn("需要 root 身份运行（扫描期间要临时挂测试整形器）。")
+        sys.exit(1)
+
+
+def check_deps():
+    missing = []
+    for cmd in ("iperf3", "tc", "ip"):
+        rc, _, _ = run_cmd(["which", cmd])
+        if rc != 0:
+            missing.append(cmd)
+    if missing:
+        warn("缺少依赖：" + "、".join(missing))
+        log("  安装：apt install -y iperf3 iproute2   或   yum install -y iperf3 iproute")
+        log("  注意：iperf3 只当客户端，装服务端时选 No。")
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------- 运营商识别
+
+def get_ssh_client_ip():
+    """从 SSH 连接环境变量取登录者的源 IP。返回 ip 字符串或 None。"""
+    for var in ("SSH_CLIENT", "SSH_CONNECTION"):
+        val = os.environ.get(var, "")
+        if not val:
+            continue
+        first = val.split()[0]
+        try:
+            ipaddress.ip_address(first)
+            return first
+        except ValueError:
+            continue
+    return None
+
+
+def lookup_ip(ip):
+    """查 IP 的运营商/归属（免费 ip-api）。失败返回 None。"""
+    url = IP_API_URL.format(ip=ip)
+    req = urllib.request.Request(url, headers={"User-Agent": "vps-test/1.0.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=IP_API_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
+            json.JSONDecodeError, OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("status") != "success":
+        return None
+    return {
+        "ip": data.get("query", ip),
+        "isp": data.get("isp", ""),
+        "org": data.get("org", ""),
+        "as": data.get("as", ""),
+        "country": data.get("country", ""),
+        "region": data.get("regionName", ""),
+        "city": data.get("city", ""),
+    }
+
+
+def classify_isp(info):
+    """按 ASN/运营商归属分类。返回 (isp_no 或 None, is_datacenter)。"""
+    text = " ".join([
+        str(info.get("isp", "")),
+        str(info.get("org", "")),
+        str(info.get("as", "")),
+    ]).lower()
+    # 先认居民宽带运营商（顺序重要：广电全称含 "network"，不能先判机房词）。
+    for no, (_name, keywords) in ISPS.items():
+        if any(kw in text for kw in keywords):
+            return no, False
+    # 再看是不是数据中心 / 云厂商 / VPN。
+    if any(kw in text for kw in DATACENTER_KEYWORDS):
+        return None, True
+    return None, False
+
+
+def manual_isp_menu(detected_no=None):
+    """手动选运营商。返回 1-4。"""
+    log()
+    log("请选择你的宽带运营商：")
+    for no in sorted(ISPS):
+        log(f"  {no}. {ISPS[no][0]}")
+    while True:
+        try:
+            ans = input("请选择 [1-4]：").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            warn("已取消。")
+            sys.exit(1)
+        if ans in ("1", "2", "3", "4"):
+            no = int(ans)
+            if detected_no is not None and no != detected_no:
+                warn(f"你选的是{ISPS[no][0]}，但检测到的是{ISPS[detected_no][0]}，"
+                     "请确认没选错。")
+                if not confirm("确定就用" + ISPS[no][0] + "？", default=False):
+                    continue
+            return no
+        log("请输入 1-4。")
+
+
+def detect_isp(cli_isp=None):
+    """识别用户运营商。返回 (isp_no, detected_info 或 None)。"""
+    if cli_isp is not None:
+        return cli_isp, None
+
+    ip = get_ssh_client_ip()
+    if ip is None:
+        warn("没检测到 SSH 连接（不是走 SSH 登录的？），请手动选择运营商。")
+        return manual_isp_menu(), None
+
+    info = lookup_ip(ip)
+    if info is None:
+        warn("运营商查询接口没通，请手动选择运营商。")
+        return manual_isp_menu(), None
+
+    isp_no, is_dc = classify_isp(info)
+    addr = "".join(x for x in (info.get("country", ""), info.get("region", ""),
+                               info.get("city", "")) if x)
+    log()
+    log("检测到你的网络：")
+    log(f"  IP：      {info['ip']}")
+    log(f"  运营商：  {ISPS[isp_no][0] if isp_no else info.get('isp') or info.get('org') or '未知'}")
+    log(f"  地址：    {addr or '未知'}（仅供参考，大内网下地址可能不准确）")
+
+    if is_dc:
+        # 梯子/机房 IP：不是用户真实的本地运营商，拿它调优没有意义。
+        warn("这个 IP 属于数据中心/云厂商，你现在可能挂着梯子——")
+        warn("它不是你真实的本地运营商，按它选测速点没有意义。")
+        log("请手动选择你真实的宽带运营商：")
+        return manual_isp_menu(), info
+
+    if isp_no is None:
+        warn("没认出这个 IP 属于哪家运营商，请手动选择：")
+        return manual_isp_menu(), info
+
+    # 居民宽带：自动选中，等用户回车确认，错了按 1-4 改。
+    log()
+    log(f"确认无误请按回车，选错了按 1-4 重新选（检测到你是{ISPS[isp_no][0]}）：")
+    try:
+        ans = input().strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return isp_no, info
+    if ans in ("1", "2", "3", "4"):
+        no = int(ans)
+        if no != isp_no:
+            warn(f"你选的是{ISPS[no][0]}，但检测到的是{ISPS[isp_no][0]}，请确认没选错。")
+            if not confirm("确定就用" + ISPS[no][0] + "？", default=False):
+                return manual_isp_menu(detected_no=isp_no), info
+        return no, info
+    return isp_no, info
+
+
+# ---------------------------------------------------------------- 测速点选择
+
+def ping_avg(host, count=3):
+    """ping 取平均延迟（毫秒）。失败返回 None。"""
+    rc, out, _ = run_cmd(["ping", "-c", str(count), "-W", "2", host], timeout=15)
+    if rc != 0:
+        return None
+    m = re.search(r"rtt min/avg/max/mdev = [\d.]+/([\d.]+)/", out)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
+def pick_peer(cli_peer=None):
+    """选测速点：ping 两个默认点，取延迟低的；--peer 优先。"""
+    if cli_peer:
+        return cli_peer, "手动指定"
+    best = None
+    for host, label in PEERS:
+        rtt = ping_avg(host)
+        if rtt is not None:
+            log(f"  测速点 {label}（{host}）延迟 {rtt:.1f} ms")
+            if best is None or rtt < best[0]:
+                best = (rtt, host, label)
+    if best is None:
+        warn("两个默认测速点都 ping 不通，默认用东京 Leaseweb。")
+        return PEERS[1][0], PEERS[1][1] + "（默认）"
+    return best[1], f"{best[2]}（延迟 {best[0]:.1f} ms）"
+
+
+# ---------------------------------------------------------------- 网卡与 qdisc
+
+def detect_iface():
+    """找默认路由网卡。"""
+    rc, out, _ = run_cmd(["ip", "-j", "route", "show", "default"])
+    if rc == 0:
+        try:
+            routes = json.loads(out)
+            for r in routes:
+                if isinstance(r, dict) and r.get("dev"):
+                    return r["dev"]
+        except (json.JSONDecodeError, ValueError):
+            pass
+    rc, out, _ = run_cmd(["ip", "route", "show", "default"])
+    if rc == 0:
+        m = re.search(r"\bdev\s+(\S+)", out)
+        if m:
+            return m.group(1)
+    return None
+
+
+def tc(*args):
+    """跑一条 tc 命令。返回 (rc, stdout)。"""
+    return run_cmd(["tc"] + list(args))
+
+
+def qdisc_root_kind(iface):
+    """读根 qdisc 种类，如 fq / fq_codel / htb / mq / noqueue。"""
+    rc, out, _ = tc("qdisc", "show", "dev", iface)
+    if rc != 0:
+        return ""
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == "qdisc" and "root" in parts:
+            # 只认本网卡的行（防御：输出里混进 lo/docker0 时不认错）。
+            if len(parts) >= 5 and parts[3] == "dev" and parts[4] != iface:
+                continue
+            return parts[1]
+    return ""
+
+
+def _strip_unit(val):
+    """去 tc 显示的单位后缀（473000b -> 473000，40960p -> 40960）；
+    速率类（946Mbit）原样保留。"""
+    if val.endswith(("b", "p")) and val[:-1].isdigit():
+        return val[:-1]
+    return val
+
+
+class QdiscGuard:
+    """扫描期间临时挂测试整形器，结束（包括被中断）时恢复原状。
+
+    注意：只记 qdisc 种类不够。htb 这类带配置的 qdisc（速率、class、
+    叶子）光重加一个裸 htb 会丢配置，而且裸 htb 没有 class 会断网。
+    所以进场时把 htb 的关键参数也抓下来，恢复时原样重建；抓不到就
+    退回 fq（不限速但不断网），并大声警告。
+    """
+
+    # 光重加种类就完整的无配置 qdisc。
+    CLASSLESS = {
+        "fq", "fq_codel", "sfq", "pfifo", "bfifo", "pfifo_fast",
+        "noqueue", "mq", "fq_pie", "codel", "pie", "red", "choke",
+        "drr", "qfq",
+    }
+    # 带配置的 qdisc：htb 尝试原样恢复，其余退回 fq + 警告。
+    CLASSFUL = {"htb", "tbf", "hfsc", "netem", "cbq"}
+
+    def __init__(self, iface):
+        self.iface = iface
+        self.saved_kind = ""
+        self.saved_htb = None
+        self._old_handlers = {}
+
+    def __enter__(self):
+        self.saved_kind = qdisc_root_kind(self.iface)
+        if self.saved_kind == "htb":
+            self.saved_htb = self._snapshot_htb()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                self._old_handlers[sig] = signal.getsignal(sig)
+                signal.signal(sig, self._on_signal)
+            except (ValueError, OSError):
+                pass
+        return self
+
+    def _snapshot_htb(self):
+        """抓 htb 的关键参数。只认 tcpfit 式布局（根 handle 1:、default 0x10、
+        单 class 1:10、叶子挂在 1:10 下），对不上就返回 None。"""
+        rc, out, _ = tc("class", "show", "dev", self.iface)
+        if rc != 0:
+            return None
+        cls = None
+        for line in out.splitlines():
+            m = re.search(r"class htb (\S+) parent 1:", line)
+            if not m:
+                continue
+            m2 = re.search(r"rate (\S+) ceil (\S+) burst (\S+) cburst (\S+)", line)
+            if not m2:
+                continue
+            cls = {
+                "classid": m.group(1),
+                "rate": m2.group(1),
+                "ceil": m2.group(2),
+                "burst": _strip_unit(m2.group(3)),
+                "cburst": _strip_unit(m2.group(4)),
+            }
+            break
+        if not cls or cls["classid"] != "1:10":
+            return None
+        rc, out, _ = tc("qdisc", "show", "dev", self.iface)
+        if rc != 0:
+            return None
+        root_ok = False
+        leaf = None
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) < 2 or parts[0] != "qdisc":
+                continue
+            # 只看本网卡的行（qdisc show 可能带出 lo/docker0）。
+            if len(parts) < 5 or parts[3] != "dev" or parts[4] != self.iface:
+                continue
+            if "root" in parts:
+                # qdisc htb 1: dev ens3 root ... default 0x10 ...
+                if parts[1] != "htb":
+                    return None
+                if "default" in parts:
+                    di = parts.index("default")
+                    if di + 1 < len(parts) and parts[di + 1] == "0x10":
+                        root_ok = True
+                continue
+            if len(parts) >= 7 and parts[5] == "parent" and parts[6] == "1:10":
+                # 挂在 1:10 下的叶子 qdisc
+                leaf = {"kind": parts[1]}
+                m = re.search(r"maxrate (\S+)", line)
+                if m:
+                    leaf["maxrate"] = m.group(1)
+                m = re.search(r"limit (\S+)", line)
+                if m:
+                    leaf["limit"] = _strip_unit(m.group(1))
+                m = re.search(r"flow_limit (\S+)", line)
+                if m:
+                    leaf["flow_limit"] = _strip_unit(m.group(1))
+        if not root_ok or not leaf:
+            return None
+        cls["leaf"] = leaf
+        return cls
+
+    def _restore_htb(self):
+        """按快照原样重建 htb（根 + class 1:10 + 叶子）。"""
+        h = self.saved_htb
+        tc("qdisc", "add", "dev", self.iface, "root",
+           "handle", "1:", "htb", "default", "10")
+        tc("class", "add", "dev", self.iface, "parent", "1:",
+           "classid", "1:10", "htb",
+           "rate", h["rate"], "ceil", h["ceil"],
+           "burst", h["burst"], "cburst", h["cburst"], "quantum", "1514")
+        leaf = h["leaf"]
+        if leaf["kind"] == "fq":
+            args = ["qdisc", "add", "dev", self.iface, "parent", "1:10",
+                    "handle", "10:", "fq"]
+            if leaf.get("limit"):
+                args += ["limit", leaf["limit"]]
+            if leaf.get("flow_limit"):
+                args += ["flow_limit", leaf["flow_limit"]]
+            if leaf.get("maxrate"):
+                args += ["maxrate", leaf["maxrate"]]
+            tc(*args)
+        elif leaf["kind"] in self.CLASSLESS:
+            tc("qdisc", "add", "dev", self.iface, "parent", "1:10",
+               "handle", "10:", leaf["kind"])
+
+    def _htb_restored_ok(self):
+        """校验 htb 是否按快照恢复：根是 htb，且 class 1:10 存在。"""
+        if qdisc_root_kind(self.iface) != "htb":
+            return False
+        rc, out, _ = tc("class", "show", "dev", self.iface)
+        if rc != 0:
+            return False
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[0] == "class" and parts[2] == "1:10":
+                return True
+        return False
+
+    def _on_signal(self, signum, _frame):
+        self.restore()
+        print()
+        warn("已中断，qdisc 已恢复。")
+        sys.exit(130)
+
+    def __exit__(self, *_exc):
+        self.restore()
+        for sig, handler in self._old_handlers.items():
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError):
+                pass
+        return False
+
+    def restore(self):
+        """删掉测试整形器，恢复原来的根 qdisc。"""
+        tc("qdisc", "del", "dev", self.iface, "root")
+        kind = self.saved_kind
+        if not kind or kind in ("noqueue", "pfifo_fast"):
+            return
+        if kind == "mq":
+            # 多队列网卡：删根后内核一般会自动重建 mq；没重建才手动补。
+            if qdisc_root_kind(self.iface) != "mq":
+                tc("qdisc", "add", "dev", self.iface, "root", "mq")
+            return
+        if kind == "htb":
+            if self.saved_htb:
+                self._restore_htb()
+                if self._htb_restored_ok():
+                    return
+                warn("htb 恢复校验没通过，已恢复为 fq（不限速）——"
+                     "请重新下发原来的整形。")
+            else:
+                # 抓不到原配置：绝不能留裸 htb（没 class 会断网），
+                # 退回 fq（不限速但不断网），让用户重新下发原整形。
+                warn("原 htb 整形配置无法解析，已恢复为 fq（不限速）——"
+                     "请重新下发原来的整形。")
+            tc("qdisc", "del", "dev", self.iface, "root")
+            tc("qdisc", "add", "dev", self.iface, "root", "fq")
+            return
+        if kind in self.CLASSFUL:
+            # 其他带配置的 qdisc（tbf/hfsc/netem…）：同样不留裸配置，
+            # 退回 fq + 警告。
+            warn(f"原 {kind} 整形配置无法完整恢复，已恢复为 fq（不限速）——"
+                 "请重新下发原来的整形。")
+            tc("qdisc", "add", "dev", self.iface, "root", "fq")
+            return
+        tc("qdisc", "add", "dev", self.iface, "root", kind)
+
+    def set_fq(self):
+        """不限速探测用：根 qdisc 换成 fq（mq 网卡不动，叶子默认就是 fq）。"""
+        kind = qdisc_root_kind(self.iface)
+        if kind in ("fq", "mq"):
+            return True
+        tc("qdisc", "del", "dev", self.iface, "root")
+        kind = qdisc_root_kind(self.iface)
+        if kind == "mq":
+            return True
+        rc, _, _ = tc("qdisc", "add", "dev", self.iface, "root", "fq")
+        return rc == 0
+
+    def apply_rate(self, rate_mbit):
+        """在网卡上挂一个 rate_mbit 的测试整形器。失败返回 False。"""
+        burst = max(32768, rate_mbit * 500)
+        tc("qdisc", "del", "dev", self.iface, "root")
+        rc, _, _ = tc("qdisc", "add", "dev", self.iface, "root",
+                      "handle", "1:", "htb", "default", "10")
+        if rc != 0:
+            return False
+        rc, _, _ = tc("class", "add", "dev", self.iface, "parent", "1:",
+                      "classid", "1:10", "htb",
+                      "rate", f"{rate_mbit}mbit", "ceil", f"{rate_mbit}mbit",
+                      "burst", str(burst), "cburst", str(burst), "quantum", "1514")
+        if rc != 0:
+            return False
+        rc, _, _ = tc("qdisc", "add", "dev", self.iface, "parent", "1:10",
+                      "handle", "10:", "fq", "limit", "40960",
+                      "flow_limit", "8192", "maxrate", f"{rate_mbit}mbit")
+        return rc == 0
+
+
+# ---------------------------------------------------------------- iperf3
+
+def run_iperf(peer, dur, streams=1):
+    """跑一次 iperf3（客户端，JSON 输出）。返回 dict 或 None。
+
+    返回：{"sent_mbps": .., "retrans": .., "recv_mbps": ..}，失败返回 None。
+    端口 5201 不通/被占时依次试 5202-5205。
+    """
+    for port in IPERF_PORTS:
+        rc, out, _ = run_cmd(
+            ["iperf3", "-c", peer, "-p", str(port), "-t", str(dur),
+             "-P", str(streams), "-J"],
+            timeout=dur + 30,
+        )
+        if rc != 0 or not out.strip():
+            continue
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            continue
+        end = data.get("end")
+        if not isinstance(end, dict):
+            continue
+        sent = end.get("sum_sent") or {}
+        recv = end.get("sum_received") or {}
+        try:
+            sent_bps = float(sent.get("bits_per_second", 0) or 0)
+            retrans = int(sent.get("retransmits", 0) or 0)
+            recv_bps = float(recv.get("bits_per_second", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if sent_bps <= 0:
+            continue
+        if recv_bps <= 0:
+            recv_bps = sent_bps
+        return {
+            "sent_mbps": sent_bps / 1e6,
+            "retrans": retrans,
+            "recv_mbps": recv_bps / 1e6,
+        }
+    return None
+
+
+def loss_pct(retrans, sent_mbps, dur):
+    """丢包率(%) = 重传数 / 发出的包数，包数按 1448 字节 MSS 估算。
+
+    不用绝对重传数：阈值 100 在 300M 机上相当于 0.032% 丢包，
+    在 7.4G 机上只有 0.0014% —— 严了 25 倍。用比率才适配任何带宽。
+    """
+    packets = sent_mbps * 1e6 * dur / 8 / MSS
+    if packets < 1:
+        packets = 1
+    return retrans * 100.0 / packets
+
+
+def calc_margin(knee_mbit):
+    """整形安全余量（Mbit），按带宽分档：固定值在小带宽上浪费太大。"""
+    if knee_mbit <= 30:
+        return 1
+    if knee_mbit <= 60:
+        return 2
+    if knee_mbit <= 100:
+        return 5
+    if knee_mbit <= 300:
+        return 10
+    if knee_mbit <= 600:
+        return 15
+    if knee_mbit <= 1000:
+        return 25
+    return 40
+
+
+def estimate_scan_traffic_gb(lo, hi, step, dur):
+    """估算一次扫描的流量（GB）：粗扫各档 + 细扫上限 8 档。"""
+    points = (hi - lo) // step + 2 + 8
+    avg_rate = (lo + hi) / 2.0
+    return points * avg_rate * dur / 8 / 1024
+
+
+# ---------------------------------------------------------------- 拐点扫描
+
+class Sweep:
+    """拐点扫描：不限速探测 -> 估算流量 -> 粗扫 -> 细扫 -> 给出拐点。"""
+
+    def __init__(self, peer, iface, dur=DEFAULT_DUR, assume_yes=False):
+        self.peer = peer
+        self.iface = iface
+        self.dur = dur
+        self.assume_yes = assume_yes
+        self.base_loss = None      # 干净链路的本底丢包率（%）
+        self.last_ok = None        # 最后一个干净档位（Mbit）
+        self.broke_at = None       # 第一个确认丢包的档位（Mbit）
+        self.spike_min_loss = None
+        self.slow_hits = 0
+        self.peer_too_slow = False
+        self.slow_at = None
+        self.verified = 0          # 拿到有效样本的档数
+        self.incomplete = False
+        self.rows = []             # 扫描记录：(速率, 送达, 重传, 丢包%, 结论)
+        self.tx0 = self.rx0 = 0
+
+    # -- 流量记账（读网卡计数器，和 tcpfit 的 traffic_report 一个办法）
+    def _traffic_mark(self):
+        def read(which):
+            try:
+                with open(f"/sys/class/net/{self.iface}/statistics/{which}_bytes") as f:
+                    return int(f.read().strip())
+            except (OSError, ValueError):
+                return 0
+        self.tx0 = read("tx")
+        self.rx0 = read("rx")
+
+    def traffic_used(self):
+        def read(which):
+            try:
+                with open(f"/sys/class/net/{self.iface}/statistics/{which}_bytes") as f:
+                    return int(f.read().strip())
+            except (OSError, ValueError):
+                return 0
+        tx = max(0, read("tx") - self.tx0)
+        rx = max(0, read("rx") - self.rx0)
+        return tx, rx
+
+    # -- 判定
+    def _is_spike(self, loss):
+        """丢包是否跳变：既要超绝对阈值，也要明显高于本底（5 倍本底，封顶 1%）。"""
+        need = LOSS_THRESHOLD
+        if self.base_loss and self.base_loss * 5 > need:
+            need = self.base_loss * 5
+        if need > 1.0:
+            need = 1.0
+        return loss > need
+
+    def _measure(self, streams=1):
+        """跑一次 iperf3，最多重试 3 次。返回结果 dict 或 None。"""
+        for _ in range(MAX_RETRIES):
+            res = run_iperf(self.peer, self.dur, streams)
+            if res is not None:
+                return res
+            time.sleep(8)
+        return None
+
+    def _print_row(self, rate, goodput, retrans, loss, verdict):
+        """实时打印一行扫描结果（别让用户对着表头干等）。"""
+        gp = f"{goodput:.1f}" if goodput is not None else "-"
+        rt = str(retrans) if retrans is not None else "-"
+        lp = f"{loss:.4f}" if loss is not None else "-"
+        log("  %-10s %12s %9s %8s  %s" % (rate, gp, rt, lp, verdict))
+
+    def _probe_point(self, rate):
+        """在指定速率档测一次（含跳变复测）。
+        返回 (goodput, retrans, loss, verdict)，测不到返回 (None, None, None, verdict)。
+        """
+        res = self._measure()
+        if res is None:
+            self.incomplete = True
+            return None, None, None, "peer busy, skipped"
+        goodput = res["recv_mbps"]
+        retrans = res["retrans"]
+        loss = loss_pct(retrans, res["sent_mbps"], self.dur)
+        self.verified += 1
+
+        # 干净样本才能建立本底。
+        if self.base_loss is None and loss <= LOSS_THRESHOLD:
+            self.base_loss = loss
+
+        if self._is_spike(loss):
+            # 单次跳变可能只是公共节点被别人占用：3 次里 >= 2 次才确认。
+            hits = 1
+            min_loss = loss
+            clean = None
+            for _ in range(2):
+                time.sleep(GAP)
+                r2 = self._measure()
+                if r2 is None:
+                    continue
+                g2 = r2["recv_mbps"]
+                l2 = loss_pct(r2["retrans"], r2["sent_mbps"], self.dur)
+                self._print_row(f"{rate} (复测)", g2, r2["retrans"], l2, "recheck")
+                self.rows.append((rate, g2, r2["retrans"], l2, "recheck"))
+                min_loss = min(min_loss, l2)
+                if self._is_spike(l2):
+                    hits += 1
+                elif clean is None:
+                    clean = (g2, r2["retrans"], l2)
+                    if self.base_loss is None:
+                        self.base_loss = l2
+            if hits >= SPIKE_HITS_NEEDED:
+                self.spike_min_loss = min_loss
+                return goodput, retrans, loss, f"loss spike ({hits}/3)"
+            if clean is not None:
+                return clean[0], clean[1], clean[2], "transient (1/3), clean recheck used"
+            time.sleep(GAP)
+            return None, None, None, "transient (1/3), no clean recheck"
+
+        # 吞吐远低于限速值、重传却很低 = 整形器没被触发，瓶颈在对端。
+        if goodput < rate * 0.7 and loss <= LOSS_THRESHOLD:
+            self.slow_hits += 1
+            if self.slow_hits >= 3:
+                self.peer_too_slow = True
+                self.slow_at = rate
+            return goodput, retrans, loss, "only %d%% of target" % int(goodput * 100 / rate)
+
+        self.slow_hits = 0
+        return goodput, retrans, loss, "ok"
+
+    def _scan_range(self, guard, lo, hi, step):
+        """扫一个区间。返回 True 表示跑完，False 表示中途遇到对端太慢。"""
+        points = list(range(lo, hi + 1, step))
+        if points[-1] != hi:
+            points.append(hi)
+        prev_gp = 0.0
+        for rate in points:
+            if not guard.apply_rate(rate):
+                warn(f"下发测试整形失败（{rate} Mbit），跳过这一档。")
+                self.incomplete = True
+                continue
+            goodput, retrans, loss, verdict = self._probe_point(rate)
+            if goodput is None:
+                if verdict == "transient (1/3), no clean recheck":
+                    continue
+                self.rows.append((rate, None, None, None, verdict))
+                self._print_row(rate, None, None, None, verdict)
+                continue
+            if "loss spike" in verdict:
+                self.rows.append((rate, goodput, retrans, loss, verdict))
+                self._print_row(rate, goodput, retrans, loss, verdict)
+                self.broke_at = rate
+                return True
+            if "only " in verdict and verdict.endswith("of target"):
+                self.rows.append((rate, goodput, retrans, loss, verdict))
+                self._print_row(rate, goodput, retrans, loss, verdict)
+                if self.peer_too_slow:
+                    return False
+                self.last_ok = rate
+                prev_gp = goodput
+                time.sleep(GAP)
+                continue
+            if prev_gp > 0 and goodput < prev_gp * 1.01:
+                verdict = "no further gain"
+            self.rows.append((rate, goodput, retrans, loss, verdict))
+            self._print_row(rate, goodput, retrans, loss, verdict)
+            self.last_ok = rate
+            prev_gp = goodput
+            time.sleep(GAP)
+        return True
+
+    def run(self):
+        """执行完整扫描。返回结果 dict。"""
+        self._traffic_mark()
+        with QdiscGuard(self.iface) as guard:
+            # -- 不限速探测：丢包低 = 没东西在打你 = 不用扫；丢包高 = 有限速器。
+            log()
+            info(f"Peer {self.peer}")
+            info(f"不限速探测（12 秒，单流）")
+            log("  %-10s %12s %9s %8s  %s" % ("速率/Mbit", "送达/Mbps", "重传", "丢包%", "结论"))
+            if not guard.set_fq():
+                warn("切到 fq 失败，探测取消。")
+                return {"status": "error", "error": "qdisc 设置失败"}
+            res = self._measure()
+            if res is None:
+                return {"status": "error", "error": "不限速探测失败，对端可能太忙，换个时间或换个测速点再试"}
+            unshaped_gp = res["recv_mbps"]
+            unshaped_loss = loss_pct(res["retrans"], res["sent_mbps"], self.dur)
+            verdict = "ok" if unshaped_loss <= LOSS_THRESHOLD else "loss -- policer present"
+            log("  %-10s %12.1f %9d %8.4f  %s" % (
+                "不限速", unshaped_gp, res["retrans"], unshaped_loss, verdict))
+            result = {
+                "status": "done",
+                "unshaped_mbps": round(unshaped_gp, 1),
+                "unshaped_loss": round(unshaped_loss, 4),
+                "knee": None,
+                "recommend": None,
+                "rows": self.rows,
+            }
+            if unshaped_loss <= LOSS_THRESHOLD:
+                log()
+                ok(f"不限速送达 {unshaped_gp:.1f} Mbps，丢包 {unshaped_loss:.4f}%，未检测到限速器。")
+                result["status"] = "no_knee"
+                return result
+
+            # -- 拐点在真实送达量之上：区间从它稍下方起，往上扫。
+            recv = unshaped_gp
+            k = 1.25 + unshaped_loss / 100 * 2
+            if k > 2.5:
+                k = 2.5
+            lo = max(1, int(recv * 0.95))
+            hi = min(10000, int(recv * k))
+            if hi <= lo:
+                hi = lo + 2
+            step = max(1, round((hi - lo) / 10))
+
+            # -- 扫之前先报流量账（教训：大带宽机器一次能扫掉上百 GB）。
+            est_gb = estimate_scan_traffic_gb(lo, hi, step, self.dur)
+            log()
+            warn(f"有限速器，准备扫描 {lo} -> {hi} Mbit。")
+            log(f"    按这个区间估算，本次扫描可能消耗约 {est_gb:.1f} GB 流量。")
+            if not self.assume_yes:
+                if not sys.stdin.isatty():
+                    # 无终端时默认取消，宁可不扫也不能无人值守地烧流量。
+                    log("    没有终端时默认取消；无人值守请加 --yes。")
+                    log("已取消扫描，没有下发任何测试整形。")
+                    result["status"] = "cancelled"
+                    return result
+                if est_gb > TRAFFIC_CONFIRM_GB:
+                    go = confirm("    按这个估算继续扫描？", default=False)
+                else:
+                    go = confirm("    继续扫描？", default=True)
+                if not go:
+                    log("已取消扫描，没有下发任何测试整形。")
+                    result["status"] = "cancelled"
+                    return result
+
+            log()
+            info(f"扫描 {lo} -> {hi} Mbit，步长 {step}，每档 {self.dur} 秒，"
+                 f"丢包阈值 > {LOSS_THRESHOLD}%")
+            log("  %-10s %12s %9s %8s  %s" % ("速率/Mbit", "送达/Mbps", "重传", "丢包%", "结论"))
+            info(f"静置 {PRE_SCAN_GAP} 秒再开始第一档")
+            time.sleep(PRE_SCAN_GAP)
+            self._scan_range(guard, lo, hi, step)
+
+            # 首档就丢包：起点可能已越过一个很浅的拐点，也可能只是路径底噪。
+            # 向下 25% 测控制点来区分，最多三次。
+            attempts = 0
+            while (self.last_ok is None and self.broke_at is not None
+                   and attempts < 3):
+                attempts += 1
+                known_broke = self.broke_at
+                known_loss = self.spike_min_loss
+                control = max(1, known_broke * 3 // 4)
+                if control >= known_broke:
+                    break
+                info(f"第一档就丢包，测 {control} Mbit 做低速对照")
+                self.last_ok = None
+                self.broke_at = None
+                self.base_loss = None
+                self.spike_min_loss = None
+                self._scan_range(guard, control, control, 1)
+                if self.last_ok is not None:
+                    self.broke_at = known_broke
+                    break
+                control_loss = self.spike_min_loss
+                if (control_loss is not None and known_loss is not None
+                        and control_loss <= 0.5 and known_loss <= 0.5
+                        and abs(control_loss - known_loss) <= 0.1):
+                    self.base_loss = min(control_loss, known_loss)
+                    self.last_ok = control
+                    self.broke_at = None
+                    info(f"确认为线路底噪（{self.base_loss:.4f}%），"
+                         "从原区间继续扫")
+                    self._scan_range(guard, known_broke, hi, step)
+                    break
+                if control_loss is None:
+                    break
+                known_broke = control
+                known_loss = control_loss
+
+            if self.peer_too_slow:
+                log()
+                warn(f"扫到 {self.slow_at} Mbit 时连续达不到目标速率。")
+                log("  可能的原因：1) 这条线没有限速器，到顶了；"
+                    "2) CPU 推不动这个速率；3) 对端不够快。")
+                result["status"] = "inconclusive"
+                result["error"] = "对端太慢或本机到顶，判不出限速器"
+                return result
+
+            # 粗扫只定位到拐点在 LAST_OK 与 BROKE_AT 之间，用 1/4 步长细扫。
+            if (self.last_ok is not None and self.broke_at is not None
+                    and self.broke_at - self.last_ok > 1):
+                coarse_broke = self.broke_at
+                width = coarse_broke - self.last_ok
+                fine = max(1, step // 4)
+                fine = max(fine, (width + 7) // 8)  # 细扫压到 8 档以内
+                log()
+                info(f"拐点在 {self.last_ok} 与 {coarse_broke} 之间，"
+                     f"用步长 {fine} 细扫")
+                log("  %-10s %12s %9s %8s  %s" % ("速率/Mbit", "送达/Mbps", "重传", "丢包%", "结论"))
+                self.broke_at = None
+                self._scan_range(guard, self.last_ok + fine,
+                                 coarse_broke - fine, fine)
+                if self.broke_at is None:
+                    # 细扫都没触发阈值，拐点就在粗扫那一档，保留粗扫结论。
+                    self.broke_at = coarse_broke
+
+            log()
+            if self.last_ok is None:
+                warn("没有测到可用速率，请检查测速点是否可达。")
+                result["status"] = "error"
+                result["error"] = "没有测到可用速率"
+                return result
+            if self.broke_at is None:
+                if self.incomplete:
+                    warn(f"扫描没跑完，实际只验证到 {self.last_ok} Mbit，判不出有没有限速器。")
+                    result["status"] = "inconclusive"
+                    result["error"] = "扫描不完整"
+                    return result
+                warn(f"扫到 {hi} Mbit 仍未出现丢包跳变，未检测到限速器。")
+                result["status"] = "no_knee"
+                result["scanned_to"] = hi
+                return result
+
+            knee = self.last_ok
+            margin = calc_margin(knee)
+            recommend = max(1, knee - margin)
+            result["knee"] = knee
+            result["recommend"] = recommend
+            ok(f"实测上限 {knee} Mbit，按 {knee}M 档位退 {margin} 余量"
+               f" → 建议整形值 {recommend} Mbit")
+            log(f"  （v1.0.0 只做测试，不下发整形；调优功能后续版本再加）")
+            return result
+
+
+# ---------------------------------------------------------------- 报告
+
+def verdict_text(res):
+    """一句人话结论。"""
+    status = res["status"]
+    if status == "no_knee":
+        return (f"不限速实测 {res['unshaped_mbps']} Mbps、"
+                f"丢包 {res['unshaped_loss']}%，未检测到限速器，链路干净")
+    if status == "done" and res.get("knee"):
+        return (f"实测上限 {res['knee']} Mbit，超过就丢包；"
+                f"建议整形 {res['recommend']} Mbit（v1.0.0 暂不下发）")
+    if status == "cancelled":
+        return "扫描已取消，只做了不限速探测"
+    if status == "inconclusive":
+        return "判不出有没有限速器：" + res.get("error", "")
+    return "测试未完成：" + res.get("error", "")
+
+
+def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s):
+    """生成干净的文字报告。"""
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines = [
+        "VPS 测试报告（vps-test v%s）" % VERSION,
+        "时间：%s" % now,
+        "运营商：%s" % isp_name,
+        "测速点：%s" % peer_label,
+        "",
+    ]
+    if res.get("unshaped_mbps") is not None:
+        lines.append("不限速探测：%.1f Mbps，丢包 %.4f%%" % (
+            res["unshaped_mbps"], res.get("unshaped_loss", 0)))
+    else:
+        lines.append("不限速探测：未完成（%s）" % res.get("error", "未知原因"))
+    if res.get("knee"):
+        lines.append("实测上限：%d Mbit" % res["knee"])
+        lines.append("建议整形值：%d Mbit（仅供参考，v1.0.0 不下发）" % res["recommend"])
+    elif res["status"] == "no_knee":
+        lines.append("限速器：未检测到")
+    lines.append("")
+    lines.append("结论：" + verdict_text(res))
+    lines.append("")
+    lines.append("本次测试消耗流量：出向 %s / 入向 %s / 合计 %s" % (
+        human_bytes(tx_bytes), human_bytes(rx_bytes),
+        human_bytes(tx_bytes + rx_bytes)))
+    lines.append("用时：约 %d 秒" % int(elapsed_s))
+    return "\n".join(lines) + "\n"
+
+
+def save_report(text, res):
+    """报告存到当前目录；历史记录存 ~/.vps-test/history.json，供下次对比。"""
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(os.getcwd(), f"vps-test-report-{stamp}.txt")
+    n = 2
+    while os.path.exists(path):  # 同一秒内跑两次也不覆盖
+        path = os.path.join(os.getcwd(), f"vps-test-report-{stamp}-{n}.txt")
+        n += 1
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        ok("报告已保存：" + path)
+    except OSError as exc:
+        warn("报告保存失败：" + str(exc))
+        return None
+    record = {
+        "time": stamp,
+        "unshaped_mbps": res.get("unshaped_mbps"),
+        "unshaped_loss": res.get("unshaped_loss"),
+        "knee": res.get("knee"),
+        "recommend": res.get("recommend"),
+        "status": res.get("status"),
+    }
+    try:
+        os.makedirs(HISTORY_DIR, exist_ok=True)
+        history = []
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE, encoding="utf-8") as f:
+                history = json.load(f)
+        if not isinstance(history, list):
+            history = []
+        history.append(record)
+        history = history[-HISTORY_KEEP:]
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        warn("历史记录保存失败：" + str(exc))
+        return path
+    return path
+
+
+def show_history_compare(res):
+    """跟上次测试比一比。"""
+    try:
+        with open(HISTORY_FILE, encoding="utf-8") as f:
+            history = json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return
+    if not isinstance(history, list) or len(history) < 2:
+        return
+    prev = history[-2]
+    log()
+    log("和上次测试对比：")
+    log("  上次（%s）：不限速 %s Mbps，实测上限 %s" % (
+        prev.get("time", "?"), prev.get("unshaped_mbps", "?"),
+        ("%s Mbit" % prev["knee"]) if prev.get("knee") else "未检测到限速器"))
+    log("  这次：不限速 %s Mbps，实测上限 %s" % (
+        res.get("unshaped_mbps"),
+        ("%s Mbit" % res["knee"]) if res.get("knee") else "未检测到限速器"))
+
+
+def self_cleanup():
+    """跑完自动清除本工具：删脚本自身 + 历史记录。报告文件保留
+    （它是本次测试的凭证）。"""
+    cleaned = []
+    try:
+        os.remove(os.path.abspath(__file__))
+        cleaned.append("脚本")
+    except OSError as exc:
+        warn("脚本自删失败：" + str(exc))
+    if os.path.isdir(HISTORY_DIR):
+        shutil.rmtree(HISTORY_DIR, ignore_errors=True)
+        cleaned.append("历史记录")
+    if cleaned:
+        log("已自动清除：" + "、".join(cleaned) + "（报告文件保留）。")
+
+
+def peak_reminder():
+    """晚高峰提醒：白天测的只代表白天，晚上 19:00-23:00 再跑一次验证。"""
+    hour = datetime.datetime.now().hour
+    log()
+    if 19 <= hour < 23:
+        log("现在正是晚高峰（19:00-23:00），本次成绩即为高峰表现。")
+    else:
+        log("提醒：现在是白天，成绩只代表白天；")
+        log("建议晚上 19:00-23:00 再跑一次，看晚高峰表现。")
+
+
+# ---------------------------------------------------------------- 主流程
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        description="VPS 验货工具 v%s：测真实带宽、找限速器、给人话结论。" % VERSION)
+    parser.add_argument("--isp", type=int, choices=[1, 2, 3, 4],
+                        help="跳过识别，直接指定运营商：1 电信 / 2 移动 / 3 联通 / 4 广电")
+    parser.add_argument("--peer", help="手动指定 iperf3 测速点（主机名或 IP）")
+    parser.add_argument("--yes", action="store_true",
+                        help="跳过流量确认（无人值守用）")
+    parser.add_argument("--keep", action="store_true",
+                        help="跑完不删除脚本和历史记录（默认自动清除，只留报告）")
+    parser.add_argument("--dur", type=int, default=DEFAULT_DUR,
+                        help="每个速率点测试时长（秒，默认 12，范围 5-60）")
+    parser.add_argument("--nominal", type=int, default=None,
+                        help="标称带宽（Mbit，仅用于参考，不填也可以）")
+    args = parser.parse_args(argv)
+    if args.dur < 5 or args.dur > 60:
+        parser.error("--dur 必须是 5-60 的整数")
+    if args.nominal is not None and not 1 <= args.nominal <= 100000:
+        parser.error("--nominal 必须是 1-100000 的整数")
+    if args.peer and not re.fullmatch(r"[A-Za-z0-9._:-]+", args.peer):
+        parser.error("--peer 只能是主机名或 IP")
+    return args
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    print(f"vps-test v{VERSION} —— VPS 验货：测真实带宽、找限速器")
+    print("（只做测试，不改任何系统配置）")
+    require_root()
+    check_deps()
+    started = time.time()
+
+    # 1. 运营商识别
+    isp_no, _detected = detect_isp(args.isp)
+    isp_name = ISPS[isp_no][0]
+    log()
+    log(f"运营商：{isp_name}")
+
+    # 2. 测速点选择
+    log()
+    log("选择测速点（ping 延迟低的优先）：")
+    peer, peer_label = pick_peer(args.peer)
+    log(f"  选用：{peer_label}（{peer}）")
+
+    # 3. 网卡
+    iface = detect_iface()
+    if not iface:
+        warn("找不到默认路由网卡，无法测试。")
+        return 1
+    log(f"  网卡：{iface}")
+
+    # 4. 拐点扫描
+    sweep = Sweep(peer, iface, dur=args.dur, assume_yes=args.yes)
+    res = sweep.run()
+    tx_bytes, rx_bytes = sweep.traffic_used()
+    elapsed = time.time() - started
+
+    # 5. 报告
+    log()
+    log("=" * 60)
+    log("结论：" + verdict_text(res))
+    log("=" * 60)
+    report = build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed)
+    log()
+    print(report)
+    save_report(report, res)
+    show_history_compare(res)
+    peak_reminder()
+    if not args.keep:
+        self_cleanup()
+    return 0 if res["status"] in ("done", "no_knee") else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print()
+        warn("已中断。")
+        sys.exit(130)
