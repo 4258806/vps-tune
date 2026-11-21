@@ -86,6 +86,22 @@ PEER_PROVIDER_ISP = {
 }
 
 
+def _valid_peer_host(host):
+    """测速点 host 是否合法：合法 IP，或合法主机名。
+    主机名只允许字母数字、点、连字符，且不能以连字符开头
+    （以 - 开头的主机会被 ping/iperf3 当成命令行选项解析）。
+    """
+    if not isinstance(host, str) or not host:
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    return bool(re.fullmatch(r"[A-Za-z0-9.-]+", host) and "." in host
+                and ".." not in host and not host.startswith("-"))
+
+
 def _parse_peer_hostfield(field):
     """解析 API 的 IP/HOST 字段，如 "iperf3 -c 116.169.118.91 -p 5201-5220"。
     端口范围须包含 5201（本脚本默认先试 5201），host 须是合法 IP 或主机名。
@@ -107,7 +123,7 @@ def _parse_peer_hostfield(field):
         return host
     except ValueError:
         pass
-    if re.fullmatch(r"[A-Za-z0-9.-]+", host) and "." in host and ".." not in host:
+    if _valid_peer_host(host):
         return host
     return None
 
@@ -173,8 +189,12 @@ def load_peers():
             if age < PEERS_CACHE_MAX_AGE:
                 with open(PEERS_CACHE_FILE, encoding="utf-8") as f:
                     cached = json.load(f)
+                # 缓存是本机文件，理论上可信，但读出来仍按与 API 同样的标准校验
+                # （防文件损坏或被改写后把非法 host 送进 ping/iperf3）。
                 cn = [(p[0], p[1], p[2]) for p in cached
-                      if isinstance(p, list) and len(p) == 3]
+                      if isinstance(p, list) and len(p) == 3
+                      and _valid_peer_host(p[0])
+                      and isinstance(p[1], str) and isinstance(p[2], str)]
                 if cn:
                     return cn + general, "cache"
     except (OSError, ValueError):
@@ -1645,8 +1665,8 @@ def parse_args(argv):
     args = parser.parse_args(argv)
     if args.dur < 5 or args.dur > 60:
         parser.error("--dur 必须是 5-60 的整数")
-    if args.peer and not re.fullmatch(r"[A-Za-z0-9._:-]+", args.peer):
-        parser.error("--peer 只能是主机名或 IP")
+    if args.peer and not re.fullmatch(r"(?!-)[A-Za-z0-9._:-]+", args.peer):
+        parser.error("--peer 只能是主机名或 IP（不能以 - 开头）")
     return args
 
 
