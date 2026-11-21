@@ -24,6 +24,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -313,9 +314,15 @@ def detect_isp(cli_isp=None):
 
 # ---------------------------------------------------------------- 测速点选择
 
-def ping_avg(host, count=3):
-    """ping 取平均延迟（毫秒）。失败返回 None。"""
-    rc, out, _ = run_cmd(["ping", "-c", str(count), "-W", "2", host], timeout=15)
+def ping_avg(host, count=3, version=None):
+    """ping 取平均延迟（毫秒）。version: "4" / "6" / None（默认）。失败返回 None。"""
+    cmd = ["ping"]
+    if version == "4":
+        cmd.append("-4")
+    elif version == "6":
+        cmd.append("-6")
+    cmd += ["-c", str(count), "-W", "2", host]
+    rc, out, _ = run_cmd(cmd, timeout=15)
     if rc != 0:
         return None
     m = re.search(r"rtt min/avg/max/mdev = [\d.]+/([\d.]+)/", out)
@@ -327,21 +334,100 @@ def ping_avg(host, count=3):
         return None
 
 
-def pick_peer(cli_peer=None):
-    """选测速点：ping 两个默认点，取延迟低的；--peer 优先。"""
-    if cli_peer:
-        return cli_peer, "手动指定"
+def detect_ip_stack():
+    """检测本机 IP 栈。返回 (has_v4, has_v6, v4_addrs, v6_addrs)。
+
+    只认全局单播地址（scope global），回环/链路本地不算。
+    """
+    v4_addrs, v6_addrs = [], []
+    for fam, addrs in (("4", v4_addrs), ("6", v6_addrs)):
+        rc, out, _ = run_cmd(["ip", "-j", f"-{fam}", "addr",
+                              "show", "scope", "global"])
+        if rc == 0:
+            try:
+                data = json.loads(out)
+            except json.JSONDecodeError:
+                data = None
+            if isinstance(data, list):
+                for iface in data:
+                    if not isinstance(iface, dict):
+                        continue
+                    for a in iface.get("addr_info", []):
+                        if isinstance(a, dict) and a.get("local"):
+                            addrs.append(a["local"])
+                continue
+        # JSON 不可用时退回纯文本解析
+        rc, out, _ = run_cmd(["ip", f"-{fam}", "addr", "show", "scope", "global"])
+        if rc != 0:
+            continue
+        for line in out.splitlines():
+            m = re.search(r"inet6?\s+(\S+)/", line)
+            if m:
+                addrs.append(m.group(1))
+    return bool(v4_addrs), bool(v6_addrs), v4_addrs, v6_addrs
+
+
+def stack_label(has_v4, has_v6):
+    """IP 栈人话：双栈 / 仅 IPv4 / 仅 IPv6 / 未检测到。"""
+    if has_v4 and has_v6:
+        return "双栈（IPv4 + IPv6）"
+    if has_v4:
+        return "仅 IPv4"
+    if has_v6:
+        return "仅 IPv6"
+    return "未检测到公网 IP"
+
+
+def resolve_peer_versions(host):
+    """测速点支持的 IP 版本。返回 {"4", "6"} 的子集；IP 直给则返回其版本。"""
+    try:
+        ip = ipaddress.ip_address(host)
+        return {"4"} if isinstance(ip, ipaddress.IPv4Address) else {"6"}
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, OSError):
+        return set()
+    versions = set()
+    for fam, *_ in infos:
+        if fam == socket.AF_INET:
+            versions.add("4")
+        elif fam == socket.AF_INET6:
+            versions.add("6")
+    return versions
+
+
+def pick_peer(cli_peer=None, stack=(True, True)):
+    """选测速点：对每个点、用本机有的每个 IP 版本 ping，取延迟低的。
+
+    返回 (host, label, version)，version 为 "4" 或 "6"。
+    """
+    has_v4, has_v6 = stack
+    versions = []
+    if has_v4:
+        versions.append("4")
+    if has_v6:
+        versions.append("6")
+    if not versions:
+        # 检测不到 IP 栈：默认 IPv4，让 iperf3 自己决定。
+        versions = ["4"]
+    hosts = [(cli_peer, "手动指定")] if cli_peer else PEERS
     best = None
-    for host, label in PEERS:
-        rtt = ping_avg(host)
-        if rtt is not None:
-            log(f"  测速点 {label}（{host}）延迟 {rtt:.1f} ms")
-            if best is None or rtt < best[0]:
-                best = (rtt, host, label)
+    for host, label in hosts:
+        peer_versions = resolve_peer_versions(host)
+        use = [v for v in versions if v in peer_versions] or versions
+        for ver in use:
+            rtt = ping_avg(host, version=ver)
+            if rtt is not None:
+                vlabel = "IPv4" if ver == "4" else "IPv6"
+                log(f"  测速点 {label}（{host}）[{vlabel}] 延迟 {rtt:.1f} ms")
+                if best is None or rtt < best[0]:
+                    best = (rtt, host, label, ver)
     if best is None:
-        warn("两个默认测速点都 ping 不通，默认用东京 Leaseweb。")
-        return PEERS[1][0], PEERS[1][1] + "（默认）"
-    return best[1], f"{best[2]}（延迟 {best[0]:.1f} ms）"
+        warn("测速点都 ping 不通，默认用东京 Leaseweb。")
+        return PEERS[1][0], PEERS[1][1] + "（默认）", versions[0]
+    return best[1], f"{best[2]}（延迟 {best[0]:.1f} ms）", best[3]
 
 
 # ---------------------------------------------------------------- 网卡与 qdisc
@@ -620,15 +706,16 @@ class QdiscGuard:
 
 # ---------------------------------------------------------------- iperf3
 
-def run_iperf(peer, dur, streams=1):
+def run_iperf(peer, dur, version="4", streams=1):
     """跑一次 iperf3（客户端，JSON 输出）。返回 dict 或 None。
 
+    version: "4" / "6"，传给 iperf3 的 -4 / -6。
     返回：{"sent_mbps": .., "retrans": .., "recv_mbps": ..}，失败返回 None。
     端口 5201 不通/被占时依次试 5202-5205。
     """
     for port in IPERF_PORTS:
         rc, out, _ = run_cmd(
-            ["iperf3", "-c", peer, "-p", str(port), "-t", str(dur),
+            ["iperf3", f"-{version}", "-c", peer, "-p", str(port), "-t", str(dur),
              "-P", str(streams), "-J"],
             timeout=dur + 30,
         )
@@ -702,11 +789,12 @@ def estimate_scan_traffic_gb(lo, hi, step, dur):
 class Sweep:
     """拐点扫描：不限速探测 -> 估算流量 -> 粗扫 -> 细扫 -> 给出拐点。"""
 
-    def __init__(self, peer, iface, dur=DEFAULT_DUR, assume_yes=False):
+    def __init__(self, peer, iface, dur=DEFAULT_DUR, assume_yes=False, version="4"):
         self.peer = peer
         self.iface = iface
         self.dur = dur
         self.assume_yes = assume_yes
+        self.version = version
         self.base_loss = None      # 干净链路的本底丢包率（%）
         self.last_ok = None        # 最后一个干净档位（Mbit）
         self.broke_at = None       # 第一个确认丢包的档位（Mbit）
@@ -754,7 +842,7 @@ class Sweep:
     def _measure(self, streams=1):
         """跑一次 iperf3，最多重试 3 次。返回结果 dict 或 None。"""
         for _ in range(MAX_RETRIES):
-            res = run_iperf(self.peer, self.dur, streams)
+            res = run_iperf(self.peer, self.dur, self.version, streams)
             if res is not None:
                 return res
             time.sleep(8)
@@ -1048,16 +1136,21 @@ def verdict_text(res):
     return "测试未完成：" + res.get("error", "")
 
 
-def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s):
+def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s,
+                 stack_text=None, version_label=None):
     """生成干净的文字报告。"""
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = [
         "VPS 测试报告（vps-test v%s）" % VERSION,
         "时间：%s" % now,
         "运营商：%s" % isp_name,
-        "测速点：%s" % peer_label,
-        "",
     ]
+    if stack_text:
+        lines.append("本机 IP 栈：%s" % stack_text)
+    if version_label:
+        lines.append("测试走：%s" % version_label)
+    lines.append("测速点：%s" % peer_label)
+    lines.append("")
     if res.get("unshaped_mbps") is not None:
         lines.append("不限速探测：%.1f Mbps，丢包 %.4f%%" % (
             res["unshaped_mbps"], res.get("unshaped_loss", 0)))
@@ -1206,11 +1299,24 @@ def main(argv=None):
     log()
     log(f"运营商：{isp_name}")
 
+    # 1b. 本机 IP 栈（双栈 / 仅 IPv4 / 仅 IPv6）
+    has_v4, has_v6, v4_addrs, v6_addrs = detect_ip_stack()
+    stack_text = stack_label(has_v4, has_v6)
+    log()
+    log(f"本机 IP 栈：{stack_text}")
+    for a in v4_addrs:
+        log(f"  IPv4：{a}")
+    for a in v6_addrs:
+        log(f"  IPv6：{a}")
+    if not has_v4 and not has_v6:
+        warn("没检测到公网 IP，测速可能失败。")
+
     # 2. 测速点选择
     log()
     log("选择测速点（ping 延迟低的优先）：")
-    peer, peer_label = pick_peer(args.peer)
-    log(f"  选用：{peer_label}（{peer}）")
+    peer, peer_label, version = pick_peer(args.peer, (has_v4, has_v6))
+    version_label = "IPv4" if version == "4" else "IPv6"
+    log(f"  选用：{peer_label}（{peer}）[{version_label}]")
 
     # 3. 网卡
     iface = detect_iface()
@@ -1220,7 +1326,7 @@ def main(argv=None):
     log(f"  网卡：{iface}")
 
     # 4. 拐点扫描
-    sweep = Sweep(peer, iface, dur=args.dur, assume_yes=args.yes)
+    sweep = Sweep(peer, iface, dur=args.dur, assume_yes=args.yes, version=version)
     res = sweep.run()
     tx_bytes, rx_bytes = sweep.traffic_used()
     elapsed = time.time() - started
@@ -1230,7 +1336,8 @@ def main(argv=None):
     log("=" * 60)
     log("结论：" + verdict_text(res))
     log("=" * 60)
-    report = build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed)
+    report = build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed,
+                          stack_text, version_label)
     log()
     print(report)
     save_report(report, res)
