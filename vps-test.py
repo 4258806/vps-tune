@@ -35,7 +35,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "2.1.2"
+VERSION = "2.1.3"
 
 # 丢包率阈值（%）：超过即判定限速器介入。
 # 依据：七组真实数据回归，干净链路最高 0.0017%，撞限速器最低 1.35%，
@@ -773,6 +773,33 @@ def read_sysctl(name):
         return None
 
 
+def bbr_version(kernel, cc):
+    """推断当前 BBR 的版本，返回 "v3" / "v1"，不是 bbr 返回 None。
+
+    内核没有直接报 BBR 版本的接口，这里是推断，不是绝对保证：
+    1. 内核名（os.uname().release）小写后含 xanmod 或 bbrv3 → v3；
+    2. modinfo tcp_bbr 的 version 字段是 3 → v3，是 1 → v1
+       （XanMod 把 tcp_bbr 编进内核，modinfo 查不到，靠第 1 步兜底；
+       modinfo 不存在、执行失败或无 version 字段时安静降级，不报错）；
+    3. 兜底：拥塞算法是 bbr 但上面都没报 v3 → v1（官方内核）。
+    v2 从没进过正式内核，实际中遇不到，v1/v3 就够了。只读，不改任何东西。
+    """
+    if not cc or not cc.lower().startswith("bbr"):
+        return None
+    kernel_lower = (kernel or "").lower()
+    if "xanmod" in kernel_lower or "bbrv3" in kernel_lower:
+        return "v3"
+    rc, out, _ = run_cmd(["modinfo", "tcp_bbr"], timeout=10)
+    if rc == 0 and out:
+        m = re.search(r"^version:\s*(\S+)", out, re.M)
+        if m:
+            if m.group(1) == "3":
+                return "v3"
+            if m.group(1) == "1":
+                return "v1"
+    return "v1"
+
+
 def read_baseline(iface):
     """读未调优的系统参数（只读，供对照）。返回 dict。"""
     base = {}
@@ -781,6 +808,7 @@ def read_baseline(iface):
     except OSError:
         base["kernel"] = None
     base["cc"] = read_sysctl("net.ipv4.tcp_congestion_control")
+    base["bbr_version"] = bbr_version(base["kernel"], base["cc"])
     base["rmem_max"] = read_sysctl("net.core.rmem_max")
     base["wmem_max"] = read_sysctl("net.core.wmem_max")
     base["tcp_rmem"] = read_sysctl("net.ipv4.tcp_rmem")
@@ -815,6 +843,8 @@ def baseline_lines(base):
     cc = (base.get("cc") or "").lower()
     cc_mark = "（达标）" if cc.startswith("bbr") else ("（待优化，建议 BBR）" if cc else "")
     lines.append(f"  拥塞控制：{v('cc')}{cc_mark}")
+    if base.get("bbr_version"):
+        lines.append(f"  BBR 版本：{base['bbr_version']}")
     qdisc = v("qdisc")
     if base.get("htb_rate"):
         qdisc += f" {base['htb_rate']}（已有整形）"
