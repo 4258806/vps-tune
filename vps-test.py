@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-vps-test.py — VPS 验货工具 v2.1.0（“测”+“调”+简化）
+vps-test.py — VPS 验货工具 v2.1.1（“测”+“调”+简化）
 
 公开项目，给国内买 VPS 的人用。一键测出这台 VPS 的真实带宽、
 有没有限速器、限速器在哪、链路干不干净、抖动大不大，最后给一句人话结论。
@@ -35,7 +35,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 
 # 丢包率阈值（%）：超过即判定限速器介入。
 # 依据：七组真实数据回归，干净链路最高 0.0017%，撞限速器最低 1.35%，
@@ -924,11 +924,18 @@ def apply_htb_rate(iface, rate_mbit):
                   "rate", f"{rate_mbit}mbit", "ceil", f"{rate_mbit}mbit",
                   "burst", str(burst), "cburst", str(burst), "quantum", "1514")
     if rc != 0:
+        # class 没加上：根 htb 已挂、没 class 会断网，先把根拆了再认失败
+        # （v2.1.1 审计低 2）。
+        tc("qdisc", "del", "dev", iface, "root")
         return False
     rc, _, _ = tc("qdisc", "add", "dev", iface, "parent", "1:10",
                   "handle", "10:", "fq", "limit", "40960",
                   "flow_limit", "8192", "maxrate", f"{rate_mbit}mbit")
-    return rc == 0
+    if rc != 0:
+        # 叶子没加上：同样拆根，别留裸 htb + class。
+        tc("qdisc", "del", "dev", iface, "root")
+        return False
+    return True
 
 
 class QdiscGuard:
@@ -1256,15 +1263,24 @@ def parse_rate_mbit(rate_str):
     return int(round(val))
 
 
+# 达标容差（Mbit）：建议值与当前整形相差这么多以内算已达标。
+# 实测上限本身有 ±2–5 Mbit 的测量噪声，追这点差别没意义，
+# 反而每次重下整形都要拆建 qdisc（v2.1.0 真机验证：建议值 952→954
+# 抖了 2 Mbit，第二跑就把整形重下了一遍）。v2.1.1。
+SHAPING_TOLERANCE_MBIT = 5
+
+
 def shaping_status(current_mbit, knee, recommend):
     """整形达标判断。返回 (status, text)。
-    status: "ok"（已达标）/ "high"（太高会丢包）/ "low"（太低浪费带宽）/ "none"（没整形）。"""
+    status: "ok"（已达标）/ "high"（太高会丢包）/ "low"（太低浪费带宽）/ "none"（没整形）。
+    容差：与建议值/实测上限相差 5 Mbit 以内算已达标——实测上限本身有
+    ±2–5 Mbit 测量噪声，追这点差别没意义，反而每次重下整形都要拆建 qdisc。"""
     if current_mbit is None:
         return "none", f"建议整形 {recommend} Mbit"
-    if current_mbit > knee:
+    if current_mbit > knee + SHAPING_TOLERANCE_MBIT:
         return "high", (f"当前整形 {current_mbit} Mbit 高于实测上限 {knee} Mbit，会丢包；"
                         f"建议降到 {recommend} Mbit")
-    if current_mbit < recommend:
+    if current_mbit < recommend - SHAPING_TOLERANCE_MBIT:
         return "low", (f"当前整形 {current_mbit} Mbit 低于建议值 {recommend} Mbit，"
                        f"可放宽到 {recommend} Mbit")
     return "ok", f"当前整形 {current_mbit} Mbit 已达标，无需调整"
@@ -1442,12 +1458,32 @@ def htb_applied_ok(iface, rate_mbit):
     return False
 
 
+def _has_valid_snapshot():
+    """快照文件是否已有一份能用的（dict 且有 qdisc_kind）。
+    有就别重写——快照是“调优前最初的状态”，留着它回滚才能回到最初。
+    qdisc_kind 必须是字符串——rollback 里要对它做正则，list 这类
+    非字符串会让 re.fullmatch 抛 TypeError（v2.1.1 审计低 1）。"""
+    try:
+        with open(TUNE_SNAPSHOT_FILE, encoding="utf-8") as f:
+            snap = json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return False
+    return (isinstance(snap, dict)
+            and isinstance(snap.get("qdisc_kind"), str))
+
+
 def apply_tuning(iface, base, plan):
     """按方案下发调优。先存快照（存不上就停手），再逐项下发并校验。
-    返回 [(desc, ok)]。单项失败不中断后面的，最后如实汇报。"""
-    snap = snapshot_tuning_state(iface, base, plan)
-    if not save_tune_snapshot(snap):
-        return []
+    返回 [(desc, ok)]。单项失败不中断后面的，最后如实汇报。
+    快照只存一份：已有能用的快照时不覆盖——连续两次下发若覆盖快照，
+    回滚只能回到上一次下发前的状态，回不到最初状态
+    （v2.1.0 真机验证发现）。快照损坏/不存在时重新存一份。"""
+    if _has_valid_snapshot():
+        log("已有调优前保存的状态（不覆盖，回滚会回到最初状态）。")
+    else:
+        snap = snapshot_tuning_state(iface, base, plan)
+        if not save_tune_snapshot(snap):
+            return []
     results = []
     sysctl_new = {}
     for c in plan:
@@ -1503,13 +1539,21 @@ def rollback_tuning(iface):
     else:
         guard.saved_kind = kind
         htb = snap.get("htb")
+        leaf = htb.get("leaf") if isinstance(htb, dict) else None
+        # leaf 可选字段（limit/flow_limit/maxrate）若有也必须是字符串——
+        # _restore_htb 会把它们原样拼进 tc 参数，非字符串会让
+        # subprocess 抛 TypeError、回滚中途 abort（v2.1.1 审计低 3）。
+        leaf_ok = (isinstance(leaf, dict)
+                   and isinstance(leaf.get("kind"), str)
+                   and all(isinstance(leaf.get(k), str)
+                           for k in ("limit", "flow_limit", "maxrate")
+                           if leaf.get(k) is not None))
         if htb is not None and not (isinstance(htb, dict)
                                     and isinstance(htb.get("rate"), str)
                                     and isinstance(htb.get("ceil"), str)
                                     and isinstance(htb.get("burst"), str)
                                     and isinstance(htb.get("cburst"), str)
-                                    and isinstance(htb.get("leaf"), dict)
-                                    and isinstance(htb["leaf"].get("kind"), str)):
+                                    and leaf_ok):
             # htb 快照损坏：不认，按抓不到处理（restore 会退 fq + 警告）。
             # burst/cburst/leaf 也要查——_restore_htb 还要用它们，缺了会
             # KeyError 崩溃、留裸 htb（没 class 会断网）。
@@ -1771,7 +1815,7 @@ class Sweep:
         with QdiscGuard(self.iface) as guard:
             # -- 不限速探测：丢包低 = 没东西在打你 = 不用扫；丢包高 = 有限速器。
             log()
-            info(f"Peer {self.peer}")
+            info(f"Peer {mask_ip(self.peer)}")
             info(f"不限速探测（{self.dur} 秒，单流）")
             log("  %-10s %12s %9s %8s  %s" % ("速率/Mbit", "送达/Mbps", "重传", "丢包%", "结论"))
             if not guard.set_fq():
