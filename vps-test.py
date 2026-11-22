@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-vps-test.py — VPS 验货工具 v2.0.2（“测”+“调”）
+vps-test.py — VPS 验货工具 v2.1.0（“测”+“调”+简化）
 
 公开项目，给国内买 VPS 的人用。一键测出这台 VPS 的真实带宽、
 有没有限速器、限速器在哪、链路干不干净、抖动大不大，最后给一句人话结论。
@@ -9,7 +9,7 @@ vps-test.py — VPS 验货工具 v2.0.2（“测”+“调”）
 测完可下发调优（整形 + 基础参数），下发前会问一声，默认不改；回滚用 --rollback。
 
 用法（root 身份，在 VPS 上跑）：
-    python3 vps-test.py                 # 全自动：识别运营商 -> 选测速点 -> 拐点扫描 -> 报告（测完问要不要调优）
+    python3 vps-test.py                 # 全自动：识别运营商 -> 选测速点 -> 实测上限扫描 -> 报告（测完问要不要调优）
     python3 vps-test.py --isp 1         # 跳过识别，直接指定运营商（1 电信 / 2 移动 / 3 联通 / 4 广电）
     python3 vps-test.py --ip 6          # 手动指定 IP 版本（只测 IPv6；默认按延迟自动选）
     python3 vps-test.py --peer <地址>   # 手动指定 iperf3 测速点
@@ -18,7 +18,7 @@ vps-test.py — VPS 验货工具 v2.0.2（“测”+“调”）
 
 依赖：Python 3.7+ 标准库、iperf3（只当客户端）、tc（iproute2）。
 测速时只在扫描期间临时挂测试整形器，跑完立即恢复原状；调优（整形 + sysctl）
-只在用户确认后下发，下发前先存快照，--rollback 可恢复。
+只在用户确认后下发，下发前先存原始状态，--rollback 可恢复。
 """
 
 import argparse
@@ -35,7 +35,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "2.0.2"
+VERSION = "2.1.0"
 
 # 丢包率阈值（%）：超过即判定限速器介入。
 # 依据：七组真实数据回归，干净链路最高 0.0017%，撞限速器最低 1.35%，
@@ -282,9 +282,32 @@ PEERS_CACHE_FILE = os.path.join(HISTORY_DIR, "peers.json")
 TUNE_SNAPSHOT_FILE = os.path.join(HISTORY_DIR, "tune-snapshot.json")
 # v2.0 sysctl 持久化：调优的 sysctl 值写进这个文件，重启后仍生效。
 SYSCTL_PERSIST_FILE = "/etc/sysctl.d/99-vps-tune.conf"
-# v2.0 基础调优目标值：拥塞控制 BBR，缓冲 16MB（千兆级链路的经验门槛）。
+# v2.0 基础调优目标值：拥塞控制 BBR，缓冲上限按内存自适应（见 tune_buf_target）。
 TUNE_CC = "bbr"
 TUNE_BUF = 16777216
+
+
+def tune_buf_target():
+    """缓冲上限目标（字节）：按本机内存自适应。
+    16MB 是千兆级链路的经验门槛（BDP 约 12MB@100ms），但小内存机器
+    （460MB、1GB）上几个 socket 各占 16MB 会吃光内存，所以按内存分档：
+    >= 4GB 给 16MB，1-4GB 给 8MB，< 1GB 给 4MB。
+    读不到内存时默认 16MB。"""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    kb = int(line.split()[1])
+                    break
+            else:
+                return TUNE_BUF
+    except (OSError, ValueError, IndexError):
+        return TUNE_BUF
+    if kb >= 4 * 1024 * 1024:
+        return 16777216
+    if kb >= 1 * 1024 * 1024:
+        return 8388608
+    return 4194304
 
 
 # ---------------------------------------------------------------- 工具函数
@@ -495,7 +518,7 @@ def detect_isp(cli_isp=None):
                                info.get("city", "")) if x)
     log()
     log("检测到你的网络：")
-    log(f"  IP：      {info['ip']}")
+    log(f"  IP：      {mask_ip(info['ip'])}")
     log(f"  运营商：  {ISPS[isp_no][0] if isp_no else info.get('isp') or info.get('org') or '未知'}")
     log(f"  地址：    {addr or '未知'}（仅供参考，大内网下地址可能不准确）")
     if is_dc:
@@ -675,8 +698,6 @@ def _pick_best_in_group(group, versions):
         for ver in use:
             rtt = ping_avg(host, version=ver)
             if rtt is not None:
-                vlabel = "IPv4" if ver == "4" else "IPv6"
-                log(f"  测速点 {label}（{mask_ip(host)}）[{vlabel}] 延迟 {rtt:.1f} ms")
                 if best is None or rtt < best[0]:
                     best = (rtt, host, label, ver)
     if best is None:
@@ -685,18 +706,16 @@ def _pick_best_in_group(group, versions):
 
 
 def domestic_coverage_lines(peers):
-    """国内 iperf3 节点覆盖：每个运营商有没有内地节点、能不能测、谁提供的。
+    """国内 iperf3 节点覆盖：每个运营商有没有内地节点、能不能测。
     能测和不能测都列出来，使用者一眼就知道工具的国内覆盖范围；
     将来清单里出现移动/联通/广电的节点，这里自动变成可测。
-    提供方是节点清单里的公开信息（API 的 PROVIDER 字段），原样注明署名。"""
+    提供方不在这里重复写（选点行、报告、历史记录里都有），只写一次。"""
     lines = []
     for name in ("电信", "移动", "联通", "广电"):
         matched = [p for p in peers if p[2] == name]
         if matched:
             cities = "/".join(p[1].split(" ")[0] for p in matched)
-            providers = sorted(set(p[3] for p in matched if p[3]))
-            suffix = "，提供方：%s" % "/".join(providers) if providers else ""
-            lines.append("  %s：%d 个（%s）可测%s" % (name, len(matched), cities, suffix))
+            lines.append("  %s：%d 个（%s）可测" % (name, len(matched), cities))
         else:
             lines.append("  %s：0 个，不可测" % name)
     return lines
@@ -799,7 +818,7 @@ def read_baseline(iface):
 
 def baseline_lines(base):
     """未调优参数的人话行，带达标/待优化标记。缺失的显示未知。
-    缓冲 16MB 是千兆级链路的经验门槛（BDP 约 12MB@100ms），仅供参考。"""
+    缓冲目标按内存自适应（见 tune_buf_target），16MB 是大内存机器的档。"""
     def v(key):
         val = base.get(key)
         return str(val) if val is not None else "未知"
@@ -816,18 +835,25 @@ def baseline_lines(base):
         qdisc += "（达标）"
     elif base.get("qdisc") in ("pfifo_fast", "noqueue"):
         qdisc += "（待优化，建议 fq）"
-    lines.append(f"  根 qdisc：{qdisc}")
+    lines.append(f"  根队列：{qdisc}")
+    buf_target = tune_buf_target()
     for key, label in (("rmem_max", "接收缓冲上限"), ("wmem_max", "发送缓冲上限")):
         val = base.get(key)
         mark = ""
         if val is not None:
             try:
-                mark = "（达标）" if int(val) >= 16777216 else "（待优化）"
+                mark = "（达标）" if int(val) >= buf_target else "（待优化）"
             except ValueError:
                 pass
         lines.append(f"  {label}：{v(key)}{mark}")
-    lines.append(f"  TCP 读缓冲：{v('tcp_rmem')}")
-    lines.append(f"  TCP 写缓冲：{v('tcp_wmem')}")
+    # TCP 读/写缓冲是三元组（最小/默认/最大），只改最大；终端只显最大，
+    # 三个数全印出来没人看得懂。达标与否按最大算。
+    for key, label in (("tcp_rmem", "TCP 读缓冲上限"), ("tcp_wmem", "TCP 写缓冲上限")):
+        mx = _tcp_buf_max(base.get(key))
+        mark = ""
+        if mx is not None:
+            mark = "（达标）" if mx >= buf_target else "（待优化）"
+        lines.append(f"  {label}：{mx if mx is not None else '未知'}{mark}")
     lines.append(f"  MTU：{v('mtu')}")
     return lines
 
@@ -1007,20 +1033,23 @@ class QdiscGuard:
                 continue
             # 叶子：parent 1:10 的位置不固定（带 dev 时在 parts[5:7]，
             # 不带 dev 时在 parts[3:5]），扫 parts 找，不用固定下标。
+            # 参数只在确认是 1:10 叶子的行里解析——别的叶子先出现时
+            # leaf 还是 None，写进去会 TypeError 崩溃；后出现则会
+            # 静默覆盖 1:10 叶子的参数，快照存错值。
             if "parent" in parts:
                 pi = parts.index("parent")
                 if pi + 1 < len(parts) and parts[pi + 1] == "1:10":
                     # 挂在 1:10 下的叶子 qdisc
                     leaf = {"kind": parts[1]}
-                m = re.search(r"\bmaxrate (\S+)", line)
-                if m:
-                    leaf["maxrate"] = m.group(1)
-                m = re.search(r"\blimit (\S+)", line)
-                if m:
-                    leaf["limit"] = _strip_unit(m.group(1))
-                m = re.search(r"\bflow_limit (\S+)", line)
-                if m:
-                    leaf["flow_limit"] = _strip_unit(m.group(1))
+                    m = re.search(r"\bmaxrate (\S+)", line)
+                    if m:
+                        leaf["maxrate"] = m.group(1)
+                    m = re.search(r"\blimit (\S+)", line)
+                    if m:
+                        leaf["limit"] = _strip_unit(m.group(1))
+                    m = re.search(r"\bflow_limit (\S+)", line)
+                    if m:
+                        leaf["flow_limit"] = _strip_unit(m.group(1))
         if not root_ok or not leaf:
             return None
         cls["leaf"] = leaf
@@ -1101,18 +1130,18 @@ class QdiscGuard:
                 self._restore_htb()
                 if self._htb_restored_ok():
                     return
-                warn("htb 恢复校验没通过，已恢复为 fq（不限速）——" + reapply)
+                warn("原来的整形没能恢复，已换成不限速（不影响上网）——" + reapply)
             else:
                 # 抓不到原配置：绝不能留裸 htb（没 class 会断网），
                 # 退回 fq（不限速但不断网），让用户重新下发原整形。
-                warn("原 htb 整形配置无法解析，已恢复为 fq（不限速）——" + reapply)
+                warn("原来的整形配置读不出来，已换成不限速（不影响上网）——" + reapply)
             tc("qdisc", "del", "dev", self.iface, "root")
             tc("qdisc", "add", "dev", self.iface, "root", "fq")
             return
         if kind in self.CLASSFUL:
             # 其他带配置的 qdisc（tbf/hfsc/netem…）：同样不留裸配置，
             # 退回 fq + 警告。
-            warn(f"原 {kind} 整形配置无法完整恢复，已恢复为 fq（不限速）——"
+            warn(f"原来的 {kind} 整形配置没能完整恢复，已换成不限速（不影响上网）——"
                  + reapply)
             tc("qdisc", "add", "dev", self.iface, "root", "fq")
             return
@@ -1319,20 +1348,22 @@ def plan_tuning(base, res):
         cur = parse_rate_mbit(base.get("htb_rate")) if base.get("qdisc") == "htb" else None
         if st == "none":
             plan.append({"kind": "shaping", "rate": recommend,
-                         "desc": f"整形：下发 htb {recommend} Mbit（当前无整形）"})
+                         "desc": f"整形：设上限 {recommend} Mbit（当前无整形）"})
         elif st == "high":
             plan.append({"kind": "shaping", "rate": recommend,
-                         "desc": f"整形：{cur} Mbit → {recommend} Mbit（当前高于实测上限，会丢包）"})
+                         "desc": f"整形：上限 {cur} Mbit → {recommend} Mbit（当前高于实测上限，会丢包）"})
         elif st == "low":
             plan.append({"kind": "shaping", "rate": recommend,
-                         "desc": f"整形：{cur} Mbit → {recommend} Mbit（当前低于建议值）"})
+                         "desc": f"整形：上限 {cur} Mbit → {recommend} Mbit（当前低于建议值）"})
     shaping = any(c["kind"] == "shaping" for c in plan)
-    # 基础参数：拥塞控制 BBR、缓冲 16MB。只改不达标的。
+    # 基础参数：拥塞控制 BBR、缓冲上限按内存自适应（见 tune_buf_target）。
+    # 只改不达标的。
     cc = (base.get("cc") or "").lower()
     if cc and not cc.startswith("bbr"):
         plan.append({"kind": "sysctl", "key": "net.ipv4.tcp_congestion_control",
                      "old": base.get("cc"), "new": TUNE_CC,
-                     "desc": f"拥塞控制：{base.get('cc')} → {TUNE_CC}"})
+                     "desc": f"拥塞控制：{base.get('cc')} → {TUNE_CC}（换成更快的 BBR 算法）"})
+    buf_target = tune_buf_target()
     for key, label in (("net.core.rmem_max", "接收缓冲上限"),
                        ("net.core.wmem_max", "发送缓冲上限")):
         val = base.get(key.replace("net.core.", ""))
@@ -1340,24 +1371,24 @@ def plan_tuning(base, res):
             cur = int(val) if val is not None else None
         except ValueError:
             cur = None
-        if cur is not None and cur < TUNE_BUF:
+        if cur is not None and cur < buf_target:
             plan.append({"kind": "sysctl", "key": key, "old": val,
-                         "new": str(TUNE_BUF),
-                         "desc": f"{label}：{val} → {TUNE_BUF}"})
+                         "new": str(buf_target),
+                         "desc": f"{label}：{val} → {buf_target}"})
     for key, label in (("net.ipv4.tcp_rmem", "TCP 读缓冲上限"),
                        ("net.ipv4.tcp_wmem", "TCP 写缓冲上限")):
         short = key.split(".")[-1]
         mx = _tcp_buf_max(base.get(short))
-        if mx is not None and mx < TUNE_BUF:
+        if mx is not None and mx < buf_target:
             parts = str(base.get(short)).split()
-            new = f"{parts[0]} {parts[1]} {TUNE_BUF}"
+            new = f"{parts[0]} {parts[1]} {buf_target}"
             plan.append({"kind": "sysctl", "key": key, "old": base.get(short),
                          "new": new,
-                         "desc": f"{label}：{mx} → {TUNE_BUF}"})
-    # 根 qdisc：只有不下发整形、且当前是 pfifo_fast/noqueue 时才换 fq。
+                         "desc": f"{label}：{mx} → {buf_target}"})
+    # 根队列：只有不下发整形、且当前是 pfifo_fast/noqueue 时才换 fq。
     # 下发整形时根会变成 htb（叶子就是 fq），不用再单独换。
     if not shaping and base.get("qdisc") in ("pfifo_fast", "noqueue"):
-        plan.append({"kind": "qdisc", "desc": f"根 qdisc：{base.get('qdisc')} → fq"})
+        plan.append({"kind": "qdisc", "desc": f"根队列：{base.get('qdisc')} → fq"})
     return plan
 
 
@@ -1390,7 +1421,7 @@ def save_tune_snapshot(snap):
         with open(TUNE_SNAPSHOT_FILE, "w", encoding="utf-8") as f:
             json.dump(snap, f, ensure_ascii=False, indent=2)
     except OSError as exc:
-        warn("调优快照保存失败（无法回滚，已停止下发）：" + str(exc))
+        warn("调优前状态保存失败（无法回滚，已停止下发）：" + str(exc))
         return False
     return True
 
@@ -1454,10 +1485,10 @@ def rollback_tuning(iface):
         with open(TUNE_SNAPSHOT_FILE, encoding="utf-8") as f:
             snap = json.load(f)
     except (OSError, json.JSONDecodeError, ValueError):
-        warn("没有调优快照（~/.vps-test/tune-snapshot.json），无需回滚。")
+        warn("没有调优前保存的状态（~/.vps-test/tune-snapshot.json），无需回滚。")
         return False
     if not isinstance(snap, dict):
-        warn("调优快照损坏，无法回滚。")
+        warn("调优前保存的状态损坏，无法回滚。")
         return False
     log("正在回滚调优（恢复下发前状态）……")
     # qdisc：按快照原样恢复，复用 QdiscGuard.restore() 的逻辑。
@@ -1466,18 +1497,38 @@ def rollback_tuning(iface):
     kind = snap.get("qdisc_kind") or ""
     guard = QdiscGuard(iface)
     if kind and not re.fullmatch(r"[a-z0-9_]+", kind):
-        warn(f"快照里的 qdisc 种类异常（{kind}），已恢复为 fq（不限速）。")
+        warn(f"保存的状态里队列种类异常（{kind}），已恢复为 fq（不限速）。")
         guard.saved_kind = "fq"
         guard.saved_htb = None
     else:
         guard.saved_kind = kind
-        guard.saved_htb = snap.get("htb")
+        htb = snap.get("htb")
+        if htb is not None and not (isinstance(htb, dict)
+                                    and isinstance(htb.get("rate"), str)
+                                    and isinstance(htb.get("ceil"), str)
+                                    and isinstance(htb.get("burst"), str)
+                                    and isinstance(htb.get("cburst"), str)
+                                    and isinstance(htb.get("leaf"), dict)
+                                    and isinstance(htb["leaf"].get("kind"), str)):
+            # htb 快照损坏：不认，按抓不到处理（restore 会退 fq + 警告）。
+            # burst/cburst/leaf 也要查——_restore_htb 还要用它们，缺了会
+            # KeyError 崩溃、留裸 htb（没 class 会断网）。
+            warn("保存的状态里整形配置损坏，已恢复为 fq（不限速）。")
+            htb = None
+        guard.saved_htb = htb
     guard.restore(advise_reapply=False)
     kind = qdisc_root_kind(iface)
     log(f"  根 qdisc 已恢复：{kind or '未知'}")
     # sysctl：写回原始值，删持久化文件。
     restored = []
-    for key, val in (snap.get("sysctl") or {}).items():
+    sysctl_snap = snap.get("sysctl")
+    if sysctl_snap is not None and not isinstance(sysctl_snap, dict):
+        warn("保存的状态里 sysctl 配置损坏，跳过 sysctl 恢复。")
+        sysctl_snap = {}
+    for key, val in (sysctl_snap or {}).items():
+        if not isinstance(key, str) or not isinstance(val, str):
+            warn("sysctl 恢复跳过脏项（键/值不是字符串）。")
+            continue
         if write_sysctl(key, val):
             restored.append(key)
         else:
@@ -1512,6 +1563,19 @@ def _iface_bytes(iface, which):
             return int(f.read().strip())
     except (OSError, ValueError):
         return 0
+
+
+def probe_shaped(peer, dur, version="4"):
+    """下发整形后复测：直接对带整形的网卡跑 iperf3，不碰 qdisc。
+    返回 (goodput_mbps, loss_pct)，测不到返回 None。
+    和 probe_unshaped 的区别：probe_unshaped 先切 fq 再测（测不限速），
+    这里不切（测整形后的实际送达）。只测一次，失败就回落到预期值。"""
+    res = run_iperf(peer, dur, version, streams=1)
+    if res is None:
+        return None
+    gp = res["recv_mbps"]
+    loss = loss_pct(res["retrans"], res["sent_mbps"], dur)
+    return round(gp, 1), round(loss, 4)
 
 
 def probe_unshaped(peer, iface, dur, version="4"):
@@ -1632,8 +1696,8 @@ class Sweep:
                     continue
                 g2 = r2["recv_mbps"]
                 l2 = loss_pct(r2["retrans"], r2["sent_mbps"], self.dur)
-                self._print_row(f"{rate} (复测)", g2, r2["retrans"], l2, "recheck")
-                self.rows.append((rate, g2, r2["retrans"], l2, "recheck"))
+                self._print_row(f"{rate} (复测)", g2, r2["retrans"], l2, "复测")
+                self.rows.append((rate, g2, r2["retrans"], l2, "复测"))
                 min_loss = min(min_loss, l2)
                 if self._is_spike(l2):
                     hits += 1
@@ -1643,11 +1707,11 @@ class Sweep:
                         self.base_loss = l2
             if hits >= SPIKE_HITS_NEEDED:
                 self.spike_min_loss = min_loss
-                return goodput, retrans, loss, f"loss spike ({hits}/3)"
+                return goodput, retrans, loss, f"丢包突增（{hits}/3）"
             if clean is not None:
-                return clean[0], clean[1], clean[2], "transient (1/3), clean recheck used"
+                return clean[0], clean[1], clean[2], "瞬时丢包（1/3），复测干净"
             time.sleep(GAP)
-            return None, None, None, "transient (1/3), no clean recheck"
+            return None, None, None, "瞬时丢包（1/3），复测仍丢包"
 
         # 吞吐远低于限速值、重传却很低 = 整形器没被触发，瓶颈在对端。
         if goodput < rate * 0.7 and loss <= LOSS_THRESHOLD:
@@ -1655,10 +1719,10 @@ class Sweep:
             if self.slow_hits >= 3:
                 self.peer_too_slow = True
                 self.slow_at = rate
-            return goodput, retrans, loss, "only %d%% of target" % int(goodput * 100 / rate)
+            return goodput, retrans, loss, "仅为目标的 %d%%" % int(goodput * 100 / rate)
 
         self.slow_hits = 0
-        return goodput, retrans, loss, "ok"
+        return goodput, retrans, loss, "干净"
 
     def _scan_range(self, guard, lo, hi, step):
         """扫一个区间。返回 True 表示跑完，False 表示中途遇到对端太慢。"""
@@ -1673,17 +1737,17 @@ class Sweep:
                 continue
             goodput, retrans, loss, verdict = self._probe_point(rate)
             if goodput is None:
-                if verdict == "transient (1/3), no clean recheck":
+                if verdict == "瞬时丢包（1/3），复测仍丢包":
                     continue
                 self.rows.append((rate, None, None, None, verdict))
                 self._print_row(rate, None, None, None, verdict)
                 continue
-            if "loss spike" in verdict:
+            if "丢包突增" in verdict:
                 self.rows.append((rate, goodput, retrans, loss, verdict))
                 self._print_row(rate, goodput, retrans, loss, verdict)
                 self.broke_at = rate
                 return True
-            if "only " in verdict and verdict.endswith("of target"):
+            if verdict.startswith("仅为目标的"):
                 self.rows.append((rate, goodput, retrans, loss, verdict))
                 self._print_row(rate, goodput, retrans, loss, verdict)
                 if self.peer_too_slow:
@@ -1693,7 +1757,7 @@ class Sweep:
                 time.sleep(GAP)
                 continue
             if prev_gp > 0 and goodput < prev_gp * 1.01:
-                verdict = "no further gain"
+                verdict = "再往上没收益"
             self.rows.append((rate, goodput, retrans, loss, verdict))
             self._print_row(rate, goodput, retrans, loss, verdict)
             self.last_ok = rate
@@ -1718,7 +1782,7 @@ class Sweep:
                 return {"status": "error", "error": "不限速探测失败，对端可能太忙，换个时间或换个测速点再试"}
             unshaped_gp = res["recv_mbps"]
             unshaped_loss = loss_pct(res["retrans"], res["sent_mbps"], self.dur)
-            verdict = "ok" if unshaped_loss <= LOSS_THRESHOLD else "loss -- policer present"
+            verdict = "干净" if unshaped_loss <= LOSS_THRESHOLD else "丢包——有限速器"
             log("  %-10s %12.1f %9d %8.4f  %s" % (
                 "不限速", unshaped_gp, res["retrans"], unshaped_loss, verdict))
             result = {
@@ -1834,7 +1898,7 @@ class Sweep:
                 fine = max(1, step // 4)
                 fine = max(fine, (width + 7) // 8)  # 细扫压到 8 档以内
                 log()
-                info(f"拐点在 {self.last_ok} 与 {coarse_broke} 之间，"
+                info(f"实测上限在 {self.last_ok} 与 {coarse_broke} 之间，"
                      f"用步长 {fine} 细扫")
                 log("  %-10s %12s %9s %8s  %s" % ("速率/Mbit", "送达/Mbps", "重传", "丢包%", "结论"))
                 self.broke_at = None
@@ -1910,17 +1974,16 @@ def domestic_verdict_line(dom_probe, dom_skip_reason=None):
 
 
 def tuning_compare_lines(res, base):
-    """调优前后对比。“调优后”是按建议值整形后的预期，不是实测——
-    等下发整形并复测后，这里会换成实测对比。v2.0 下发后会在“调优后”里
-    注明“已下发”，但送达/丢包仍是预期值（未复测）。
+    """调优前后对比。下发整形并复测后，“调优后”是实测值；
+    没复测（复测失败或没下发）时才写预期值，并注明“预期”。
     颜色（终端才上色，存文件时去掉）：调优前红色（当前状态、有丢包），
-    调优后绿色（预期改善）；已达标/无需整形的好状态也是绿色。"""
+    调优后绿色（实测改善或预期改善）；已达标/无需整形的好状态也是绿色。"""
     lines = ["调优前后对比："]
     if res["status"] == "no_knee":
         lines.append(green("  未检测到限速器，链路干净，无需整形。"))
         return lines
     if not res.get("knee"):
-        lines.append("  本次未测出拐点，无法对比。")
+        lines.append("  本次未测出上限，无法对比。")
         return lines
     knee = res["knee"]
     rec = res["recommend"]
@@ -1936,8 +1999,13 @@ def tuning_compare_lines(res, base):
     lines.append(red(f"  调优前（当前）：{before}，实测上限 {knee} Mbit，"
                      f"不限速送达 {unshaped:.1f} Mbps、丢包 {loss:.4f}%"))
     if res.get("shaping_status") == "applied":
-        lines.append(green(f"  调优后（已下发整形 {rec} Mbit）："
-                           f"送达约 {rec} Mbit，丢包约 0%（不再撞限速器）"))
+        if res.get("tuned_mbps") is not None:
+            lines.append(green(f"  调优后（已下发整形 {rec} Mbit，实测）："
+                               f"送达 {res['tuned_mbps']:.1f} Mbps，"
+                               f"丢包 {res.get('tuned_loss', 0):.4f}%"))
+        else:
+            lines.append(green(f"  调优后（已下发整形 {rec} Mbit）："
+                               f"送达约 {rec} Mbit，丢包约 0%（不再撞限速器）"))
     else:
         lines.append(green(f"  调优后（建议整形 {rec} Mbit，预期）："
                            f"送达约 {rec} Mbit，丢包约 0%（不再撞限速器）"))
@@ -1964,7 +2032,7 @@ def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s,
         cap_line += "（%s）" % mask_ip(cap_host)
     lines.append(cap_line)
     if res.get("quick"):
-        lines.append("模式：快速粗测（每档 5 秒、不细扫，拐点精度较粗）")
+        lines.append("模式：快速粗测（每档 5 秒、不细扫，实测上限精度较粗）")
     if base:
         lines.append("")
         lines.append("当前系统参数（未调优）：")
@@ -2022,7 +2090,7 @@ def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s,
         lines.append(dom_line)
     if res.get("tuning_applied") or res.get("tuning_failed"):
         lines.append("")
-        lines.append("本次调优（v2.0 已下发）：")
+        lines.append("本次调优（已下发）：")
         for d in res.get("tuning_applied") or []:
             lines.append("  已应用：" + d)
         for d in res.get("tuning_failed") or []:
@@ -2126,6 +2194,9 @@ def show_history_compare(res, dom_probe=None):
     if not isinstance(history, list) or len(history) < 2:
         return
     prev = history[-2]
+    if not isinstance(prev, dict):
+        # 历史条目损坏（不是 dict）：跳过对比，不崩。
+        return
     log()
     log("和上次测试对比：")
     log("  上次（%s）：不限速 %s Mbps，实测上限 %s" % (
@@ -2190,7 +2261,7 @@ def parse_args(argv):
                         help="每个速率点测试时长（秒，默认 12，范围 5-60）")
     parser.add_argument("--quick", action="store_true",
                         help="快速模式：每档 5 秒、只粗扫不细扫，流量省约 2/3，"
-                             "拐点精度较粗（约一个粗步长）")
+                             "实测上限精度较粗（约一个粗步长）")
     args = parser.parse_args(argv)
     if args.dur < 5 or args.dur > 60:
         parser.error("--dur 必须是 5-60 的整数")
@@ -2305,7 +2376,7 @@ def main(argv=None):
     # 4. 拐点扫描（能力点：测 VPS 自己的限速器）
     dur = min(args.dur, 5) if args.quick else args.dur
     if args.quick:
-        log("快速模式：每档 5 秒、只粗扫不细扫（拐点精度较粗）。")
+        log("快速模式：每档 5 秒、只粗扫不细扫（实测上限精度较粗）。")
     sweep = Sweep(peer, iface, dur=dur, assume_yes=args.yes, version=version,
                   quick=args.quick)
     res = sweep.run()
@@ -2378,12 +2449,44 @@ def main(argv=None):
                         warn("未生效：" + desc)
                 res["tuning_applied"] = [d for d, f in results if f]
                 res["tuning_failed"] = [d for d, f in results if not f]
-                # 整形已下发：报告里的整形状态改为已下发。
-                if any(c["kind"] == "shaping" for c in plan):
+                # 整形已下发：只有整形项真正成功才标 applied。
+                # 以前只看方案里有没有整形项，整形下发失败也会误标已下发。
+                shaping_plan = next((c for c in plan if c["kind"] == "shaping"), None)
+                shaping_ok = (shaping_plan is not None
+                              and shaping_plan["desc"] in res["tuning_applied"])
+                if shaping_ok:
                     res["shaping_text"] = f"已下发整形 {res['recommend']} Mbit（本次调优）"
                     res["shaping_status"] = "applied"
+                    # v2.1 复测：下发后实测一次（5 秒），调优后不再是预期值。
+                    # 复测不碰 qdisc（probe_shaped 直接测带整形的网卡），
+                    # 否则会先拆掉刚下发的整形、测到的是不限速值。
+                    log()
+                    log("下发后复测（5 秒，单流）：")
+                    tx0, rx0 = _iface_bytes(iface, "tx"), _iface_bytes(iface, "rx")
+                    tuned = probe_shaped(peer, 5, version)
+                    tx_bytes += max(0, _iface_bytes(iface, "tx") - tx0)
+                    rx_bytes += max(0, _iface_bytes(iface, "rx") - rx0)
+                    elapsed = time.time() - started
+                    if tuned is not None:
+                        res["tuned_mbps"], res["tuned_loss"] = tuned
+                        log(f"  下发后实测送达 {tuned[0]:.1f} Mbps，丢包 {tuned[1]:.4f}%")
+                        # 复核整形仍在（防复测期间被别的改动拆掉）。
+                        if not htb_applied_ok(iface, res["recommend"]):
+                            warn("  复测后整形不在了（可能被别的改动拆掉），请重新下发整形。")
+                            res["shaping_status"] = "none"
+                            res["shaping_text"] = None
+                            res.pop("tuned_mbps", None)
+                            res.pop("tuned_loss", None)
+                            # “已应用”里那条整形也清掉，免得报告里“已应用”
+                            # 和结论“未下发”说法打架。
+                            res["tuning_applied"] = [
+                                d for d in res["tuning_applied"]
+                                if d != shaping_plan["desc"]]
+                            res["tuning_failed"].append(shaping_plan["desc"])
+                    else:
+                        warn("  复测失败，调优后仍按预期显示。")
             else:
-                log("调优未下发（快照保存失败，系统未改动）。")
+                log("调优未下发（调优前状态保存失败，系统未改动）。")
         else:
             log("已跳过调优（系统未改动）。")
 
@@ -2398,8 +2501,8 @@ def main(argv=None):
     report = build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed,
                           stack_text, version_label, base, dom_probe,
                           dom_skip_reason=dom_skip_reason, cap_host=peer)
-    log()
-    print(report)
+    # v2.1 简化：结论框已印过关键数字，整份报告不再往终端重印一遍
+    # （报告里有同样的结论和数字）；只存文件，终端只提示路径。
     save_report(report, res, dom_probe)
     show_history_compare(res, dom_probe)
     peak_reminder()
