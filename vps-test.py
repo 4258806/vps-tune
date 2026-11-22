@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-vps-test.py — VPS 验货工具 v2.1.1（“测”+“调”+简化）
+vps-test.py — VPS 验货工具 v2.1.2（“测”+“调”+简化）
 
 公开项目，给国内买 VPS 的人用。一键测出这台 VPS 的真实带宽、
 有没有限速器、限速器在哪、链路干不干净、抖动大不大，最后给一句人话结论。
@@ -35,7 +35,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "2.1.1"
+VERSION = "2.1.2"
 
 # 丢包率阈值（%）：超过即判定限速器介入。
 # 依据：七组真实数据回归，干净链路最高 0.0017%，撞限速器最低 1.35%，
@@ -518,7 +518,7 @@ def detect_isp(cli_isp=None):
                                info.get("city", "")) if x)
     log()
     log("检测到你的网络：")
-    log(f"  IP：      {mask_ip(info['ip'])}")
+    log(f"  IP：      {info['ip']}")
     log(f"  运营商：  {ISPS[isp_no][0] if isp_no else info.get('isp') or info.get('org') or '未知'}")
     log(f"  地址：    {addr or '未知'}（仅供参考，大内网下地址可能不准确）")
     if is_dc:
@@ -669,19 +669,6 @@ def resolve_peer_versions(host):
         elif fam == socket.AF_INET6:
             versions.add("6")
     return versions
-
-
-def mask_ip(ip):
-    """IP 脱敏（报告和终端展示用，不存完整 IP）：
-    主机名原样返回；IPv4 只留前 3 段（122.228.230.x）；IPv6 只留前 4 组。"""
-    try:
-        addr = ipaddress.ip_address(ip)
-    except ValueError:
-        return ip  # 主机名，原样返回
-    if isinstance(addr, ipaddress.IPv4Address):
-        return ".".join(ip.split(".")[:3]) + ".x"
-    groups = [g.lstrip("0") or "0" for g in addr.exploded.split(":")]
-    return ":".join(groups[:4]) + ":..."
 
 
 def _pick_best_in_group(group, versions):
@@ -1408,6 +1395,13 @@ def plan_tuning(base, res):
     return plan
 
 
+def all_ok_line_needed(plan, res):
+    """v2.1.2：plan 为空（没东西可调）且本次正常完成时，印绿色收尾行
+    “各项参数全部达标，无需调优。”。取消/失败/有东西可调时不印——
+    有方案要调的时候出现的是调优方案和确认问题，不是这行。"""
+    return not plan and res.get("status") in ("done", "no_knee")
+
+
 def tuning_plan_lines(plan):
     """调优方案的人话行。"""
     return ["  " + c["desc"] for c in plan]
@@ -1815,7 +1809,7 @@ class Sweep:
         with QdiscGuard(self.iface) as guard:
             # -- 不限速探测：丢包低 = 没东西在打你 = 不用扫；丢包高 = 有限速器。
             log()
-            info(f"Peer {mask_ip(self.peer)}")
+            info(f"Peer {self.peer}")
             info(f"不限速探测（{self.dur} 秒，单流）")
             log("  %-10s %12s %9s %8s  %s" % ("速率/Mbit", "送达/Mbps", "重传", "丢包%", "结论"))
             if not guard.set_fq():
@@ -2059,8 +2053,8 @@ def tuning_compare_lines(res, base):
 def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s,
                  stack_text=None, version_label=None, base=None, dom_probe=None,
                  dom_skip_reason=None, cap_host=None):
-    """生成干净的文字报告。cap_host 是能力点的主机名/IP（报告里展示，
-    主机名原样显示，IP 只显示前 3 段脱敏）。"""
+    """生成干净的文字报告。cap_host 是能力点的主机名/IP（报告里完整展示，
+    v2.1.2 起终端和报告都显示完整 IP，不再脱敏）。"""
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = [
         "VPS 测试报告（vps-test v%s）" % VERSION,
@@ -2073,7 +2067,7 @@ def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s,
         lines.append("测试走：%s" % version_label)
     cap_line = "能力点：%s" % peer_label
     if cap_host:
-        cap_line += "（%s）" % mask_ip(cap_host)
+        cap_line += "（%s）" % cap_host
     lines.append(cap_line)
     if res.get("quick"):
         lines.append("模式：快速粗测（每档 5 秒、不细扫，实测上限精度较粗）")
@@ -2104,7 +2098,7 @@ def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s,
         lines.append("")
         dom_detail = []
         if dom_probe.get("peer"):
-            dom_detail.append(mask_ip(dom_probe["peer"]))
+            dom_detail.append(dom_probe["peer"])
         if dom_probe.get("provider"):
             dom_detail.append(dom_probe["provider"] + " 提供")
         if dom_detail:
@@ -2132,6 +2126,8 @@ def build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed_s,
     dom_line = domestic_verdict_line(dom_probe, dom_skip_reason)
     if dom_line:
         lines.append(dom_line)
+    if res.get("all_ok"):
+        lines.append("各项参数全部达标，无需调优。")
     if res.get("tuning_applied") or res.get("tuning_failed"):
         lines.append("")
         lines.append("本次调优（已下发）：")
@@ -2375,14 +2371,14 @@ def main(argv=None):
     if args.ip:
         version_label += "（手动指定）"
     cap_rtt_txt = "（延迟 %.1f ms）" % cap_rtt if cap_rtt is not None else ""
-    log(f"  能力点：{peer_label}{cap_rtt_txt}（{mask_ip(peer)}）[{version_label}]")
+    log(f"  能力点：{peer_label}{cap_rtt_txt}（{peer}）[{version_label}]")
     if dom is not None:
         dom_peer, dom_label, dom_version, dom_rtt = dom
         dom_skip_reason = None
         dom_provider = next((p[3] for p in peers if p[0] == dom_peer), "")
         dom_rtt_txt = "（延迟 %.1f ms）" % dom_rtt if dom_rtt is not None else ""
         dom_label_full = dom_label + dom_rtt_txt + ("（%s 提供）" % dom_provider if dom_provider else "")
-        log(f"  国内点：{dom_label_full}（{mask_ip(dom_peer)}）")
+        log(f"  国内点：{dom_label_full}（{dom_peer}）")
     else:
         dom_peer = None
         dom_provider = ""
@@ -2542,6 +2538,11 @@ def main(argv=None):
     if dom_line:
         log(dom_line)
     log("=" * 60)
+    # v2.1.2：全达标、无需调优时，绿色收尾行——跑完别只剩“报告已保存”，
+    # 要明确说一句“都挺好、不用动”（用户在 rn 上手动跑 v2.1.1 时问“这就完事了？”）。
+    if all_ok_line_needed(plan, res):
+        ok(green("各项参数全部达标，无需调优。"))
+        res["all_ok"] = True
     report = build_report(res, isp_name, peer_label, tx_bytes, rx_bytes, elapsed,
                           stack_text, version_label, base, dom_probe,
                           dom_skip_reason=dom_skip_reason, cap_host=peer)
