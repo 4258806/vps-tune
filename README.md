@@ -72,6 +72,8 @@ VPS 验货工具：测真实带宽、找限速器、给人话结论。给国内�
 
 ## 用法
 
+支持 Debian / Ubuntu（已在 Debian 13、Ubuntu 24.04 上验证）。
+
 在 VPS 上以 root 身份运行：
 
 ```bash
