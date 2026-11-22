@@ -35,7 +35,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "2.1.3"
+VERSION = "2.1.4"
 
 # 丢包率阈值（%）：超过即判定限速器介入。
 # 依据：七组真实数据回归，干净链路最高 0.0017%，撞限速器最低 1.35%，
@@ -1336,16 +1336,38 @@ def write_sysctl(name, value):
 def persist_sysctl(changes):
     """把改过的 sysctl 值写进 /etc/sysctl.d/99-vps-tune.conf，重启后仍生效。
     changes 是 {key: value}。只写白名单里的键、值符合安全格式的，
-    其他一律跳过（防脏数据进持久化文件）。写失败只警告（/proc 已即时生效，
-    只是重启后会丢），不算调优失败。"""
-    lines = ["# vps-tune v2.0 调优（下发时写入，--rollback 时删除）"]
+    其他一律跳过（防脏数据进持久化文件）。合并写入：先读现有文件、
+    保留其中已有的键，只更新/新增本次的键——第二次调优不再丢掉
+    第一轮的键。已有行只保留键名合法、值格式安全的，异常行丢弃
+    （文件由本工具管理，异常行只可能来自手工误改）。写失败只警告
+    （/proc 已即时生效，只是重启后会丢），不算调优失败。"""
+    merged = {}
+    try:
+        with open(SYSCTL_PERSIST_FILE, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip()
+                if not re.fullmatch(r"[A-Za-z0-9_.]+", key):
+                    continue
+                if not val or not re.fullmatch(r"[A-Za-z0-9_ .]+", val):
+                    continue
+                merged[key] = val
+    except OSError:
+        pass  # 文件不存在或读不了：从空开始写。
     for key in sorted(changes):
         val = str(changes[key])
         if key not in TUNE_SYSCTL_KEYS:
             continue
         if not re.fullmatch(r"[A-Za-z0-9_ .]+", val):
             continue
-        lines.append(f"{key} = {val}")
+        merged[key] = val
+    lines = ["# vps-tune v2.0 调优（下发时写入，--rollback 时删除）"]
+    for key in sorted(merged):
+        lines.append(f"{key} = {merged[key]}")
     try:
         os.makedirs(os.path.dirname(SYSCTL_PERSIST_FILE), exist_ok=True)
         with open(SYSCTL_PERSIST_FILE, "w", encoding="utf-8") as f:
@@ -1496,14 +1518,60 @@ def _has_valid_snapshot():
             and isinstance(snap.get("qdisc_kind"), str))
 
 
+def _merge_new_sysctl_into_snapshot(plan):
+    """已有有效快照时，把本次 plan 里快照中没有的 sysctl 键的原始值补进去。
+    已有的键绝不覆盖——快照存的是调优前最初的状态。qdisc 部分不动。
+    补完后原子写回（先写临时文件再替换），写失败不破坏已有快照，
+    只警告、不中断下发（已有快照还在，顶多新键回滚不了）。
+    plan 里 sysctl 项的 old 就是本次下发前的值；第一轮没动过的键，
+    这个值就是最初值，补进去正好。"""
+    try:
+        with open(TUNE_SNAPSHOT_FILE, encoding="utf-8") as f:
+            snap = json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return
+    if not isinstance(snap, dict):
+        return
+    sysctl_snap = snap.get("sysctl")
+    if not isinstance(sysctl_snap, dict):
+        sysctl_snap = {}
+        snap["sysctl"] = sysctl_snap
+    added = []
+    for c in plan:
+        if c.get("kind") != "sysctl" or c.get("old") is None:
+            continue
+        key = c.get("key")
+        old = c.get("old")
+        if (isinstance(key, str) and isinstance(old, str)
+                and key in TUNE_SYSCTL_KEYS and key not in sysctl_snap):
+            sysctl_snap[key] = old
+            added.append(key)
+    if not added:
+        return
+    tmp = TUNE_SNAPSHOT_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(snap, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, TUNE_SNAPSHOT_FILE)
+    except (OSError, TypeError, ValueError):
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        warn("快照补充新键失败（新键回滚可能恢复不了）：" + "、".join(added))
+
+
 def apply_tuning(iface, base, plan):
     """按方案下发调优。先存快照（存不上就停手），再逐项下发并校验。
     返回 [(desc, ok)]。单项失败不中断后面的，最后如实汇报。
     快照只存一份：已有能用的快照时不覆盖——连续两次下发若覆盖快照，
     回滚只能回到上一次下发前的状态，回不到最初状态
-    （v2.1.0 真机验证发现）。快照损坏/不存在时重新存一份。"""
+    （v2.1.0 真机验证发现）。但第二跑 plan 里若有快照中没有的新
+    sysctl 键，把它们的原始值补进快照（不覆盖已有键），否则新键
+    回滚时恢复不了。快照损坏/不存在时重新存一份。"""
     if _has_valid_snapshot():
         log("已有调优前保存的状态（不覆盖，回滚会回到最初状态）。")
+        _merge_new_sysctl_into_snapshot(plan)
     else:
         snap = snapshot_tuning_state(iface, base, plan)
         if not save_tune_snapshot(snap):
