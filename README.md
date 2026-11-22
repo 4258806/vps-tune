@@ -72,7 +72,7 @@ VPS 验货工具：测真实带宽、找限速器、给人话结论。给国内�
 
 ## 用法
 
-支持 Debian / Ubuntu（已在 Debian 13、Ubuntu 24.04 上验证）。
+支持 Debian / Ubuntu（需 Python 3.7+，即 Debian 10+ / Ubuntu 20.04+；已在 Debian 13、Ubuntu 24.04 上验证）。
 
 在 VPS 上以 root 身份运行：
 
