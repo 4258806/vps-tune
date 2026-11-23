@@ -4,6 +4,11 @@ VPS 验货工具：测真实带宽、找限速器、给人话结论。给国内�
 
 一键测出这台 VPS 的真实带宽、有没有限速器、限速器在哪、链路干不干净、抖动大不大，最后给一句人话结论，帮你验货、避坑。
 
+## v2.1.5：依赖自动安装
+
+- **缺依赖时问一声再装**：启动检查到缺 `iperf3`/`tc`/`ip` 时，不再直接退出——先问“是否现在自动安装？”，默认否；确认后按系统自动装（apt/dnf/yum 探测，apt 先 update，装完复查一遍），拒绝或装失败仍退出。`--yes` 下直接装，不再问。
+- **安装只用写死的包名映射**：`iperf3`→iperf3，`tc`/`ip`→iproute2（apt）/iproute（yum/dnf），不拼用户输入；全程列表参数、不走 shell。
+
 ## v2.1.4：两处收尾修复 + `--ip 6` 真机验证
 
 - **sysctl 持久化合并写入**：`/etc/sysctl.d/99-vps-tune.conf` 不再是每次从头写——先读已有文件、保留上一轮的键，只更新/新增本轮的键。以前第二轮调优会丢掉第一轮的键（重启后才丢，平时看不出来）。异常行（无等号、坏键名、空值、坏值格式）直接丢弃，不崩。
@@ -99,12 +104,14 @@ python3 vps-test.py --ip 6          # 手动指定 IP 版本（只测 IPv6；默
 python3 vps-test.py --peer <地址>   # 手动指定 iperf3 测速点
 python3 vps-test.py --quick         # 快速模式：每档 5 秒、只粗扫不细扫
 python3 vps-test.py --dur 5         # 每个速率点测试时长（秒，默认 12，范围 5-60）
-python3 vps-test.py --yes           # 跳过流量确认和调优确认（无人值守用）
+python3 vps-test.py --yes           # 跳过流量确认、调优确认和依赖安装确认（无人值守用）
 python3 vps-test.py --keep          # 跑完不删除脚本（默认只删脚本，报告和历史记录保留）
 python3 vps-test.py --rollback      # 回滚已下发的调优（恢复下发前状态）
 ```
 
 依赖：Python 3.7+ 标准库、iperf3（只当客户端）、tc（iproute2）。
+
+缺依赖时工具会先问一声，确认后自动安装（apt/dnf/yum 探测，装完复查）；拒绝或装失败则退出。`--yes` 下直接装，不再问。也可以手动装：
 
 ```bash
 apt install -y iperf3   # Debian/Ubuntu
