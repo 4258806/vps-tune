@@ -13,7 +13,7 @@ vps-test.py — VPS 验货工具 v2.1.2（“测”+“调”+简化）
     python3 vps-test.py --isp 1         # 跳过识别，直接指定运营商（1 电信 / 2 移动 / 3 联通 / 4 广电）
     python3 vps-test.py --ip 6          # 手动指定 IP 版本（只测 IPv6；默认按延迟自动选）
     python3 vps-test.py --peer <地址>   # 手动指定 iperf3 测速点
-    python3 vps-test.py --yes           # 跳过流量确认和调优确认（无人值守用）
+    python3 vps-test.py --yes           # 跳过流量确认、调优确认和依赖安装确认（无人值守用）
     python3 vps-test.py --rollback      # 回滚本工具下发的调优，恢复下发前状态（不测速）
 
 依赖：Python 3.7+ 标准库、iperf3（只当客户端）、tc（iproute2）。
@@ -35,7 +35,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "2.1.4"
+VERSION = "2.1.5"
 
 # 丢包率阈值（%）：超过即判定限速器介入。
 # 依据：七组真实数据回归，干净链路最高 0.0017%，撞限速器最低 1.35%，
@@ -400,17 +400,77 @@ def require_root():
         sys.exit(1)
 
 
-def check_deps():
+# 缺失命令 -> 包名（apt / yum|dnf）。固定映射，绝不拼用户输入。
+_DEP_PKGS = {
+    "iperf3": ("iperf3", "iperf3"),
+    "tc": ("iproute2", "iproute"),
+    "ip": ("iproute2", "iproute"),
+}
+
+
+def _detect_pkg_manager():
+    """返回 (kind, 命令)：apt / dnf / yum；都找不到返回 (None, None)。"""
+    for kind, cmd in (("apt", "apt-get"), ("dnf", "dnf"), ("yum", "yum")):
+        rc, _, _ = run_cmd(["which", cmd])
+        if rc == 0:
+            return kind, cmd
+    return None, None
+
+
+def install_deps(missing):
+    """用系统包管理器装缺失的依赖。成功返回 True，失败返回 False。"""
+    kind, mgr = _detect_pkg_manager()
+    if kind is None:
+        warn("找不到 apt/dnf/yum，请手动安装依赖。")
+        return False
+    idx = 0 if kind == "apt" else 1
+    pkgs = []
+    for cmd in missing:
+        pkg = _DEP_PKGS.get(cmd, (None, None))[idx]
+        if pkg and pkg not in pkgs:
+            pkgs.append(pkg)
+    if not pkgs:
+        return False
+    if kind == "apt":
+        log("  正在更新软件包列表…")
+        rc, _, err = run_cmd(["env", "DEBIAN_FRONTEND=noninteractive",
+                              "apt-get", "update"], timeout=300)
+        if rc != 0:
+            warn("  apt-get update 失败，继续尝试安装…")
+        argv = ["env", "DEBIAN_FRONTEND=noninteractive",
+                "apt-get", "install", "-y"] + pkgs
+    else:
+        argv = [mgr, "install", "-y"] + pkgs
+    log("  正在安装：" + " ".join(pkgs) + " …")
+    rc, _, err = run_cmd(argv, timeout=600)
+    if rc != 0:
+        warn("  安装失败：" + (err.strip().split("\n")[-1][:120] if err.strip() else "未知错误"))
+        return False
+    still = [c for c in missing if run_cmd(["which", c])[0] != 0]
+    if still:
+        warn("  装完仍找不到：" + "、".join(still))
+        return False
+    log("  依赖已装好。")
+    return True
+
+
+def check_deps(assume_yes=False):
+    """缺依赖时：默认问一声再装；--yes 则直接装；拒绝或装失败则退出。"""
     missing = []
     for cmd in ("iperf3", "tc", "ip"):
         rc, _, _ = run_cmd(["which", cmd])
         if rc != 0:
             missing.append(cmd)
-    if missing:
-        warn("缺少依赖：" + "、".join(missing))
-        log("  安装：apt install -y iperf3 iproute2   或   yum install -y iperf3 iproute")
-        log("  注意：iperf3 只当客户端，装服务端时选 No。")
+    if not missing:
+        return
+    warn("缺少依赖：" + "、".join(missing))
+    log("  手动安装：apt install -y iperf3 iproute2   或   yum install -y iperf3 iproute")
+    log("  注意：iperf3 只当客户端，装服务端时选 No。")
+    if not (assume_yes or confirm("是否现在自动安装缺失的依赖？", default=False)):
         sys.exit(1)
+    if install_deps(missing):
+        return
+    sys.exit(1)
 
 
 # ---------------------------------------------------------------- 运营商识别
@@ -2390,7 +2450,7 @@ def parse_args(argv):
                              "（默认按延迟自动选，双栈机器一般选 IPv4）。"
                              "注意：国内节点目前只有 IPv4，强制 IPv6 时国内路径跳过")
     parser.add_argument("--yes", action="store_true",
-                        help="跳过流量确认和调优确认（无人值守用）")
+                        help="跳过流量确认、调优确认和依赖安装确认（无人值守用）")
     parser.add_argument("--rollback", action="store_true",
                         help="回滚本工具下发的调优，恢复下发前状态（不测速）")
     parser.add_argument("--keep", action="store_true",
@@ -2420,7 +2480,7 @@ def main(argv=None):
             warn("找不到默认路由网卡，无法回滚。")
             return 1
         return 0 if rollback_tuning(iface) else 1
-    check_deps()
+    check_deps(assume_yes=args.yes)
     started = time.time()
 
     # 1. 运营商识别
